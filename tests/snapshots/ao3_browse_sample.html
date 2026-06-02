@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+  <body>
+    <form id="work-filters" class="narrow-hidden filters">
+      <dl>
+        <dt>Sort by</dt>
+        <dd>
+          <select name="work_search[sort_column]">
+            <option value="revised_at">Date Updated</option>
+            <option value="kudos_count">Kudos</option>
+          </select>
+        </dd>
+        <dt>Ratings</dt>
+        <dd>
+          <ul>
+            <li>
+              <input id="rating-teen" type="checkbox" name="include_work_search[rating_ids][]" value="11">
+              <label for="rating-teen">Teen And Up Audiences (3523)</label>
+            </li>
+          </ul>
+        </dd>
+        <dt>Ratings</dt>
+        <dd>
+          <ul>
+            <li>
+              <input id="exclude-explicit" type="checkbox" name="exclude_work_search[rating_ids][]" value="13">
+              <label for="exclude-explicit">Explicit (1182)</label>
+            </li>
+          </ul>
+        </dd>
+        <dt>Language</dt>
+        <dd>
+          <select name="work_search[language_id]">
+            <option value="">Any</option>
+            <option value="en">English</option>
+          </select>
+        </dd>
+      </dl>
+    </form>
+    <ol class="work index group">
+      <li id="work_12345" class="work blurb group" role="article">
+        <h4 class="heading">
+          <a href="/works/12345">A Useful Work</a>
+          by <a rel="author" href="/users/example/pseuds/example">example</a>
+        </h4>
+        <ul class="required-tags">
+          <li class="category-f-f" title="F/F"><span>F/F</span></li>
+        </ul>
+        <blockquote class="userstuff summary"><p>A small summary.</p></blockquote>
+        <ul class="tags commas">
+          <li class="fandoms"><a class="tag" href="/tags/Fandom/works">Fandom</a></li>
+          <li class="relationships"><a class="tag" href="/tags/A*s*B/works">A/B</a></li>
+          <li class="freeforms"><a class="tag" href="/tags/Slow%20Burn/works">Slow Burn</a></li>
+        </ul>
+        <dl class="stats">
+          <dd class="language">English</dd>
+          <dd class="words">12,345</dd>
+          <dd class="chapters">3/7</dd>
+          <dd class="kudos">456</dd>
+          <dd class="bookmarks">78</dd>
+          <dd class="hits">9,999</dd>
+          <dd class="comments">12</dd>
+        </dl>
+      </li>
+    </ol>
+  </body>
+</html>

@@ -1,0 +1,37 @@
+[project]
+name = "ao3-studio"
+version = "0.1.0"
+description = "Local-first AO3 browsing and evaluation studio built with NiceGUI."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ao3_api==2.3.1",
+    "beautifulsoup4>=4.13.4",
+    "curl_cffi>=0.15.0",
+    "httpx>=0.28.1",
+    "lxml>=5.4.0",
+    "nicegui[native]==3.12.0",
+    "pillow>=11.0.0",
+    "pydantic>=2.12.0",
+    "tzdata>=2026.1",
+    "websockets>=16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.0.0",
+    "ruff>=0.14.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

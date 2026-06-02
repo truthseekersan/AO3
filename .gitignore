@@ -1,0 +1,65 @@
+# Python/runtime
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# AO3 Studio private local state
+/config/
+/logs/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Browser/session/private artifacts
+/ao3_browser_profile/
+cookies.sqlite
+cookies.sqlite-*
+Local State
+Session Storage/
+Service Worker/
+Crashpad/
+*.dmp
+
+# Secrets and local machine config
+.env
+.env.*
+!.env.example
+*token*.txt
+*pat*.txt
+*.pem
+*.key
+*.p12
+
+# Local smoke/test output
+*.log
+*.out.log
+*.err.log
+*.tmp
+*.bak
+*.lnk
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Editor/OS noise
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

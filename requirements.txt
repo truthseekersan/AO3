@@ -1,0 +1,10 @@
+beautifulsoup4>=4.13.4
+ao3_api==2.3.1
+curl_cffi>=0.15.0
+httpx>=0.28.1
+lxml>=5.4.0
+nicegui[native]==3.12.0
+pillow>=11.0.0
+pydantic>=2.12.0
+tzdata>=2026.1
+websockets>=16.0
