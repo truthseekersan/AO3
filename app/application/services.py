@@ -298,6 +298,7 @@ def default_fandom_filter(tag: str) -> dict[str, Any]:
     return {
         "fandom": tag,
         "sort_column": "revised_at",
+        "sort_direction": "desc",
         "query": "",
         "page": 1,
         "other_tag_names": "",
@@ -1344,6 +1345,11 @@ class EvaluationQueueService:
             summary = self._batch_summary(batch, self.identities.get_or_create_local().local_user_id)
             if summary and summary.total_count > 0 and summary.completed_count >= summary.total_count:
                 return ServiceResult(False, f"{work_set.name} has already completed {schema.name}. Clean it up before rerunning.")
+            if batch.status is EvaluationBatchStatus.ARCHIVED:
+                batch.status = EvaluationBatchStatus.QUEUED
+                batch.completed_at = None
+                batch.updated_at = utc_now_iso()
+                self.batches.save(batch)
         else:
             batch = self._ensure_batch(work_set, schema.schema_key)
         queued = self._queue_unevaluated_for_batch(batch, reason=f"Queued under {schema.name}")
@@ -1352,6 +1358,53 @@ class EvaluationQueueService:
             True,
             f"Queued {queued} work{'s' if queued != 1 else ''} under {schema.name}.",
             payload={"batch": batch, "queued": queued},
+        )
+
+    def clean_queue_schema_slot(self, work_set_id: str, schema_key: str) -> ServiceResult:
+        work_set = self.work_sets.get(work_set_id)
+        if not work_set:
+            return ServiceResult(False, "Queue cluster was not found.")
+        schema = self._schema(schema_key)
+        batch = self.batches.get_by_work_set_schema(work_set.id, schema.schema_key)
+        if not batch:
+            return ServiceResult(True, f"{schema.name} has no queued work for {work_set.name}.")
+        work_ids = self.work_sets.list_work_ids(work_set.id)
+        deleted_rows = self._remove_queue_batch_or_archive(batch)
+        deleted_cache = self.works.delete_unprotected_by_ids(work_ids)
+        return ServiceResult(
+            True,
+            f"Cleaned {schema.name} queue for {work_set.name}: {deleted_rows} queue row"
+            f"{'s' if deleted_rows != 1 else ''}, and {deleted_cache} now-unprotected cached work"
+            f"{'s' if deleted_cache != 1 else ''}.",
+        )
+
+    def clean_queue_clusters(self, work_set_ids: list[str]) -> ServiceResult:
+        clean_ids = [str(work_set_id) for work_set_id in dict.fromkeys(work_set_ids) if str(work_set_id).strip()]
+        if not clean_ids:
+            return ServiceResult(False, "Select at least one queue cluster to clean.")
+        cleaned_clusters = 0
+        cleaned_batches = 0
+        deleted_rows = 0
+        touched_work_ids: set[str] = set()
+        for work_set_id in clean_ids:
+            work_set = self.work_sets.get(work_set_id)
+            if not work_set:
+                continue
+            touched_work_ids.update(self.work_sets.list_work_ids(work_set.id))
+            batches = self.batches.list_for_work_set(work_set.id)
+            for batch in batches:
+                deleted_rows += self._remove_queue_batch_or_archive(batch)
+                cleaned_batches += 1
+            if self.batches.count_for_work_set(work_set.id) == 0:
+                self.work_sets.delete(work_set.id)
+            cleaned_clusters += 1
+        deleted_cache = self.works.delete_unprotected_by_ids(list(touched_work_ids))
+        return ServiceResult(
+            True,
+            f"Cleaned {cleaned_clusters} queue cluster{'s' if cleaned_clusters != 1 else ''}, "
+            f"{cleaned_batches} schema slot{'s' if cleaned_batches != 1 else ''}, "
+            f"{deleted_rows} queue row{'s' if deleted_rows != 1 else ''}, "
+            f"and {deleted_cache} now-unprotected cached work{'s' if deleted_cache != 1 else ''}.",
         )
 
     def clean_evaluated_schema_slot(self, work_set_id: str, schema_key: str) -> ServiceResult:
@@ -1669,6 +1722,22 @@ class EvaluationQueueService:
         deleted_evaluations = self.evaluations.delete_for_works_schema(delete_eval_ids, identity.local_user_id, batch.schema_key)
         return deleted_evaluations, deleted_queue_rows
 
+    def _remove_queue_batch_or_archive(self, batch: EvaluationBatch) -> int:
+        work_set = self.work_sets.get(batch.work_set_id)
+        deleted_rows = self.queue.delete_for_batch(batch.id)
+        completed = self._completed_count_for_batch(batch) if work_set else 0
+        if completed > 0:
+            if batch.status is not EvaluationBatchStatus.ARCHIVED:
+                batch.status = EvaluationBatchStatus.ARCHIVED
+                batch.completed_at = None
+                batch.updated_at = utc_now_iso()
+                self.batches.save(batch)
+        else:
+            self.batches.delete(batch.id)
+            if work_set and self.batches.count_for_work_set(work_set.id) == 0:
+                self.work_sets.delete(work_set.id)
+        return deleted_rows
+
     def _batch_summaries(self, fandom_key: str) -> list[EvaluationBatchSummary]:
         summaries: list[EvaluationBatchSummary] = []
         identity = self.identities.get_or_create_local()
@@ -1705,7 +1774,9 @@ class EvaluationQueueService:
         failed = sum(1 for row in rows if row.queue_status is QueueStatus.FAILED and row.work_id not in completed_ids)
         skipped = sum(1 for row in rows if row.queue_status is QueueStatus.SKIPPED and row.work_id not in completed_ids)
         queued_rows = sum(1 for row in rows if row.queue_status is QueueStatus.QUEUED and row.work_id not in completed_ids)
-        pending_missing_rows = max(0, len([work_id for work_id in work_ids if work_id not in completed_ids]) - running - failed - skipped - queued_rows)
+        pending_missing_rows = 0
+        if batch.status is not EvaluationBatchStatus.ARCHIVED:
+            pending_missing_rows = max(0, len([work_id for work_id in work_ids if work_id not in completed_ids]) - running - failed - skipped - queued_rows)
         self._sync_batch_status_from_counts(batch, len(work_ids), len(completed_ids))
         return EvaluationBatchSummary(
             batch=batch,
@@ -1721,6 +1792,8 @@ class EvaluationQueueService:
 
     def _sync_batch_status_from_counts(self, batch: EvaluationBatch, total: int, completed: int) -> None:
         if total <= 0:
+            return
+        if batch.status is EvaluationBatchStatus.ARCHIVED:
             return
         if completed >= total:
             status = EvaluationBatchStatus.COMPLETE
@@ -2300,6 +2373,7 @@ class AO3BrowseService:
         selected = state.get("selected") if isinstance(state.get("selected"), dict) else {}
         params: list[tuple[str, str]] = [
             ("work_search[sort_column]", normalize_ao3_sort_column(state.get("sort_column"))),
+            ("work_search[sort_direction]", "asc" if str(state.get("sort_direction")) == "asc" else "desc"),
             *cls._selected_filter_params(selected, "include_work_search"),
             ("work_search[other_tag_names]", str(state.get("other_tag_names") or "")),
             *cls._selected_filter_params(selected, "exclude_work_search"),

@@ -5,7 +5,15 @@ import inspect
 from app.application.composition import build_container
 from app.domain.entities import Work
 from app.domain.enums import RarityTier
-from app.presentation.ui.app_shell import FONT_CATEGORIES, FONT_COLORS, AO3StudioShell
+from app.presentation.ui.app_shell import (
+    AO3_METADATA_SORT_PILLS,
+    FONT_CATEGORIES,
+    FONT_COLORS,
+    AO3StudioShell,
+    _reader_apply_pov_paragraph_colors,
+    _scriptstudio_lighten_color,
+)
+from app.presentation.ui.theme import apply_theme
 
 
 def test_scriptstudio_font_options_include_recursive_family() -> None:
@@ -25,6 +33,42 @@ def test_reader_typography_uses_scriptstudio_font_specific_weights() -> None:
     assert AO3StudioShell._font_typography_css("'Fraunces', serif", 16) == (
         "font-weight: 275; font-variation-settings: 'opsz' 16, 'SOFT' 70, 'WONK' 1;"
     )
+
+
+def test_reader_character_pov_tint_uses_scriptstudio_alternating_tones_without_overwriting_names() -> None:
+    fragment = (
+        '<p>One <span style="color: rgb(1,2,3); text-shadow: old;">Chloe</span>.</p>'
+        "<p>Two.</p>"
+    )
+    rendered = _reader_apply_pov_paragraph_colors(fragment, "#123456")
+
+    assert _scriptstudio_lighten_color("#123456", 0.45) == "#7c8fa2"
+    assert _scriptstudio_lighten_color("#123456", 0.65) == "#acb7c3"
+    assert "color: #7c8fa2" in rendered
+    assert "color: #acb7c3" in rendered
+    assert "color: rgb(1,2,3); text-shadow: old;" in rendered
+
+
+def test_reader_side_panel_character_pills_and_left_expanding_avatar_tooltip_exist() -> None:
+    reader_side_source = inspect.getsource(AO3StudioShell._render_reader_side_panel)
+    pill_source = inspect.getsource(AO3StudioShell._render_reader_character_pills)
+    selection_source = inspect.getsource(AO3StudioShell._reader_selected_character_id) + inspect.getsource(
+        AO3StudioShell._set_reader_character_selection
+    )
+    page_read_source = inspect.getsource(AO3StudioShell._page_read)
+    avatar_source = inspect.getsource(AO3StudioShell._avatar_image)
+    theme_source = inspect.getsource(apply_theme)
+
+    assert "_render_reader_character_pills(active)" in reader_side_source
+    assert "reader-character-pill" in pill_source
+    assert "reader_selected_character:" in selection_source
+    assert 'expand_side="left"' in pill_source
+    assert "_reader_apply_pov_paragraph_colors" in page_read_source
+    assert "_reader_highlight_characters(chapter.html, characters)" in page_read_source
+    assert page_read_source.index("_reader_highlight_characters") < page_read_source.index("_reader_apply_pov_paragraph_colors")
+    assert 'tooltip_anchor = "center left" if expand_side == "left" else "center right"' in avatar_source
+    assert 'tooltip_self = "center right" if expand_side == "left" else "center left"' in avatar_source
+    assert ".reader-character-pill" in theme_source
 
 
 def test_no_archive_warnings_are_hidden_from_warning_groups() -> None:
@@ -74,9 +118,44 @@ def test_tab_switch_renders_center_without_rebuilding_left_panel() -> None:
     assert "self.refresh()" not in source
     assert "self._render_center()" in source
     assert "self._render_top()" in source
+    assert "self._render_right_header()" in source
     assert "self._render_right()" in source
     assert "self._render_left_footer()" in source
     assert "self._render_left()" not in source
+
+
+def test_local_ao3_date_sort_keys_are_chronological_for_display_dates() -> None:
+    newer = Work(
+        "newer",
+        "https://archiveofourown.org/works/newer",
+        title="Newer",
+        published_at="08 Jan 2026",
+        last_ao3_updated_at="08 Jan 2026",
+        last_scraped_at="2026-01-01T00:00:00Z",
+    )
+    older = Work(
+        "older",
+        "https://archiveofourown.org/works/older",
+        title="Older",
+        published_at="31 Dec 2025",
+        last_ao3_updated_at="31 Dec 2025",
+        last_scraped_at="2026-01-09T00:00:00Z",
+    )
+    undated_update = Work(
+        "oneshot",
+        "https://archiveofourown.org/works/oneshot",
+        title="Oneshot",
+        published_at="07 Jan 2026",
+        last_ao3_updated_at=None,
+        last_scraped_at="2026-06-01T00:00:00Z",
+    )
+
+    by_updated = sorted([older, newer], key=lambda work: AO3StudioShell._work_sort_value(work, "revised_at"), reverse=True)
+    by_posted = sorted([older, newer], key=lambda work: AO3StudioShell._work_sort_value(work, "created_at"), reverse=True)
+
+    assert [work.work_id for work in by_updated] == ["newer", "older"]
+    assert [work.work_id for work in by_posted] == ["newer", "older"]
+    assert AO3StudioShell._work_sort_value(undated_update, "revised_at").startswith("2026-01-07")
 
 
 def test_browse_lazy_panel_and_lightweight_tag_markers_exist() -> None:
@@ -120,8 +199,27 @@ def test_cluster_pills_use_compact_tag_style_and_dialog() -> None:
     schema_pill_source = inspect.getsource(AO3StudioShell._render_schema_slot_pill)
     status_source = inspect.getsource(AO3StudioShell._render_selected_schema_status)
     filter_source = inspect.getsource(AO3StudioShell._render_cluster_filter_panel)
+    evaluated_filter_source = inspect.getsource(AO3StudioShell._render_evaluated_filter_panel)
+    works_side_source = inspect.getsource(AO3StudioShell._render_works_side_panel)
+    cluster_sort_source = inspect.getsource(AO3StudioShell._render_cluster_sort_pills)
+    browse_sort_source = inspect.getsource(AO3StudioShell._render_sort_pills)
+    segmented_source = inspect.getsource(AO3StudioShell._segmented_cluster_pills)
+    browse_source = inspect.getsource(AO3StudioShell._render_browse_lookup_panel)
+    browse_direction_source = inspect.getsource(AO3StudioShell._render_browse_sort_direction_pills)
+    cluster_state_source = inspect.getsource(AO3StudioShell._cluster_filter_state)
+    cluster_apply_source = inspect.getsource(AO3StudioShell._apply_cluster_filters)
+    cluster_set_sort_source = inspect.getsource(AO3StudioShell._set_cluster_sort)
+    cluster_set_scalar_source = inspect.getsource(AO3StudioShell._set_cluster_scalar)
+    cluster_filter_works_source = inspect.getsource(AO3StudioShell._filter_cluster_works)
     dialog_source = inspect.getsource(AO3StudioShell._open_cluster_action_dialog)
-    cleanup_source = inspect.getsource(AO3StudioShell._render_evaluated_cleanup_toolbar)
+    cleanup_source = inspect.getsource(AO3StudioShell._render_cluster_cleanup_toolbar)
+    header_source = inspect.getsource(AO3StudioShell._render_right_header)
+    right_source = inspect.getsource(AO3StudioShell._render_right)
+    top_source = inspect.getsource(AO3StudioShell._render_top)
+    cleanup_handler_source = inspect.getsource(AO3StudioShell._handle_cluster_cleanup_trash)
+    theme_source = inspect.getsource(apply_theme)
+    cleanup_theme_source = theme_source.split(".right-panel-cleanup-host", 1)[1].split(".right-panel-search", 1)[0]
+    cluster_hover_source = theme_source.split(".cluster-pill {", 1)[1].split(".browse-tag-pill-label", 1)[0]
 
     assert "Queue Clusters" not in side_source
     assert "Evaluated Clusters" not in side_source
@@ -129,12 +227,44 @@ def test_cluster_pills_use_compact_tag_style_and_dialog() -> None:
     assert "w-full justify-start mt-2" not in side_source
     assert "visible_summaries" not in side_source
     assert "_cluster_summaries_for_mode" in side_source
+    assert "right-panel-cleanup-content" in side_source
+    assert "right-panel-cleanup-header" not in side_source
+    assert "_render_cluster_cleanup_toolbar(mode" not in side_source
+    assert "_render_cluster_cleanup_toolbar(\"queue\"" in header_source
+    assert "_render_cluster_cleanup_toolbar(\"evaluated\"" in header_source
+    assert "right-panel-header-hit" in header_source
+    assert "_disarm_cluster_cleanup(\"queue\")" in header_source
+    assert "_disarm_cluster_cleanup(\"evaluated\")" in header_source
+    assert "right-panel-shell w-full h-full min-h-0 panel-bg overflow-hidden gap-0" in inspect.getsource(
+        AO3StudioShell.build
+    )
+    assert 'self.page in {"Queue", "Evaluated"}' in right_source
+    assert 'right-panel-batch-mode h-full min-h-full gap-0 p-0' in right_source
+    assert ".right-panel-column.right-panel-batch-mode" in theme_source
+    assert "height: 100% !important" in theme_source.split(".right-panel-column.right-panel-batch-mode", 1)[1].split(
+        ".right-panel-cleanup-host",
+        1,
+    )[0]
+    assert "right-panel-cleanup-host w-full h-full flex-grow" in side_source
+    assert "right-panel-cleanup-content w-full h-full flex-grow gap-2" in side_source
+    assert ".right-panel-scroll .q-scrollarea__content" in theme_source
+    assert "padding: 0 !important" in theme_source.split(".right-panel-scroll .q-scrollarea__content", 1)[1].split(
+        ".right-panel-column",
+        1,
+    )[0]
+    assert "calc(100vh" not in cleanup_theme_source
+    assert "padding: 4px 12px 12px !important" in cleanup_theme_source
     assert "self._render_schema_slot_pill" in side_source
     assert "self._render_selected_schema_status" in side_source
     assert 'ui.element("button")' in pill_source
     assert "work-tag-pill browse-tag-pill cluster-pill" in pill_source
     assert "cluster-pill-selected" in pill_source
-    assert "_tag_pill_style" in pill_source
+    assert "rgba(255,255,255,0.42)" not in pill_source
+    assert "_filter_pill_style(color, selected or cleanup_selected)" in pill_source
+    assert "_tag_pill_style" not in pill_source
+    assert ".cluster-pill:hover" in theme_source
+    assert "filter: brightness(1.14)" in theme_source
+    assert "translateY" not in cluster_hover_source
     assert "contextmenu" in pill_source
     assert "_open_cluster_action_dialog" in pill_source
     assert "filter-favorite-pill schema-slot-pill" in schema_pill_source
@@ -142,9 +272,87 @@ def test_cluster_pills_use_compact_tag_style_and_dialog() -> None:
     assert "_handle_schema_slot_click" in schema_pill_source
     assert "cleaning_services" in cleanup_source
     assert "delete" in cleanup_source
+    assert '"click.stop"' in cleanup_source
+    assert "_render_cluster_cleanup_toolbar(\"queue\"" not in top_source
+    assert "_render_cluster_cleanup_toolbar(\"evaluated\"" not in top_source
+    assert "ui.label(\"Evaluation Queue\")" not in top_source
+    assert "ui.label(\"Evaluated\")" not in top_source
+    assert "clean_queue_schema_slot" in cleanup_handler_source
+    assert "clean_queue_clusters" in cleanup_handler_source
+    assert "clean_evaluated_schema_slot" in cleanup_handler_source
+    assert "clean_evaluated_clusters" in cleanup_handler_source
     assert "soft-panel" not in status_source
     assert "Search cluster" in filter_source
-    assert "filter_alt" in filter_source.split("self._render_cluster_sort_pills", 1)[0]
+    assert "search_label" in filter_source
+    cluster_apply_row = filter_source.split("self._render_cluster_sort_pills", 1)[0]
+    assert 'icon="refresh"' in cluster_apply_row
+    assert "right-panel-icon-button" in cluster_apply_row
+    assert "filter_alt" not in cluster_apply_row
+    assert 'sort_mode="ao3"' in filter_source
+    assert "Queue Sort and Filter" not in filter_source
+    assert "Local AO3 Sort and Filter" not in filter_source
+    assert "ui.label(title)" not in filter_source
+    assert '"Direction"' not in filter_source
+    assert '"Direction"' not in cluster_sort_source
+    filter_body = filter_source.split('with ui.element("div").classes("soft-panel w-full p-3"):', 1)[1]
+    assert filter_body.index('"Desc"') < filter_body.index("search_label")
+    assert AO3_METADATA_SORT_PILLS == [
+        ("revised_at", "Updated"),
+        ("word_count", "Word Count"),
+        ("bookmarks_count", "Bookmarks"),
+        ("kudos_count", "Kudos"),
+        ("hits", "Hits"),
+        ("comments_count", "Comments"),
+        ("authors_to_sort_on", "Creator"),
+        ("title_to_sort_on", "Title"),
+        ("created_at", "Posted"),
+    ]
+    assert "AO3_METADATA_SORT_PILLS" in cluster_sort_source
+    assert "AO3_METADATA_SORT_PILLS" in browse_sort_source
+    assert "_metadata_options" not in browse_sort_source
+    assert "Evaluation Sort and Filter" not in evaluated_filter_source
+    assert '"Order"' not in evaluated_filter_source
+    assert evaluated_filter_source.index('"High"') < evaluated_filter_source.index('label="Score"')
+    evaluated_apply_row = evaluated_filter_source.split('ui.input("Min"', 1)[0]
+    assert 'icon="refresh"' in evaluated_apply_row
+    assert "right-panel-icon-button" in evaluated_apply_row
+    assert "filter_alt" not in evaluated_apply_row
+    assert "Apply evaluated score filters" in evaluated_apply_row
+    assert 'sort_mode="score"' in evaluated_filter_source
+    assert '"sort_mode"' in cluster_state_source
+    assert "state[\"sort_mode\"] = sort_mode" in cluster_apply_source
+    assert 'sort_mode="ao3"' in cluster_set_sort_source
+    assert 'key == "score_dir"' in cluster_set_scalar_source
+    assert 'key == "sort_dir"' in cluster_set_scalar_source
+    assert 'sort_mode == "score"' in cluster_filter_works_source
+    assert "cluster-filter-segmented-row" in segmented_source
+    assert "if label:" in segmented_source
+    assert ".cluster-filter-segmented-row" in theme_source
+    assert ".filter-sort-row {" in theme_source
+    assert ".filter-page-row {" in theme_source
+    assert "margin-bottom: 8px !important" in theme_source
+    assert "Sort and Filter" not in browse_source
+    assert browse_source.count('classes("soft-panel') == 1
+    assert "right-panel-three-icon-grid" in browse_source
+    assert ".right-panel-three-icon-grid" in theme_source
+    assert browse_source.index("Apply search and filters") < browse_source.index(
+        "Save current filters as this fandom's defaults"
+    )
+    assert browse_source.index("Save current filters as this fandom's defaults") < browse_source.index(
+        "Open current AO3 page in your browser"
+    )
+    assert "_render_browse_sort_direction_pills" in browse_source
+    assert "filter_alt" not in browse_source
+    assert 'rich_tooltip("Apply filters"' not in browse_source
+    assert '"sort_direction"' in browse_direction_source
+    assert '"Desc"' in browse_direction_source
+    assert '"Asc"' in browse_direction_source
+    assert "filter-page-direction-row" in browse_direction_source
+    assert ".filter-page-direction-row .q-btn" in theme_source
+    assert 'ui.expansion("AO3 Metadata Filters"' in works_side_source
+    assert "_render_cluster_filter_panel(" in works_side_source
+    assert 'search_label="Search works"' in works_side_source
+    assert "_set_works_metadata_open" in works_side_source
     assert "update_cluster_metadata" in dialog_source
     assert "schema_options_for_work_set" in dialog_source
     assert "requeue_work_set_under_schema" in dialog_source
@@ -176,6 +384,7 @@ def test_queue_evaluated_and_works_use_cached_lazy_work_render_models() -> None:
     assert "lazy_panels=True" in evaluated_source
     assert "_works_page_model_for_current_state()" in works_source
     assert "list_collected" not in works_source
+    assert '_filter_cluster_works(model.works, model, "works")' in works_source
     assert "lazy_panels=True" in works_source
     assert "lookup_model = browse_model or render_model" in render_source
     assert "lightweight=browse_actions or lazy_panels" in render_source

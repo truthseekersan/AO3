@@ -381,6 +381,52 @@ def test_grouped_cluster_schema_slots_queue_and_cleanup_schema(tmp_path) -> None
     assert container.queue_service.create_queue_for_schema_slot(work_set.id, alt_schema.schema_key).ok
 
 
+def test_queue_cleanup_archives_partial_batch_and_preserves_evaluated_results(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    profile = container.fandom_service.ensure_default()
+    schema = container.schema_service.active_schema()
+    for work_id in ["queue-clean-a", "queue-clean-b"]:
+        container.work_repo.upsert(
+            Work(work_id, f"https://archiveofourown.org/works/{work_id}", title=work_id, last_scraped_at="2026-01-01T00:00:00Z")
+        )
+    saved = container.queue_service.save_page_as_evaluation_queue(
+        fandom_key=profile.fandom_key,
+        name="Queue Cleanup Cluster",
+        filter_state={"fandom": profile.tag, "sort_column": "revised_at", "page": 1},
+        source_url="https://example.test/queue-clean",
+        work_ids=["queue-clean-a", "queue-clean-b"],
+        page_number=1,
+        schema_key=schema.schema_key,
+    )
+    work_set = saved.payload["work_set"]
+    batch = saved.payload["batch"]
+    container.evaluation_service.save_manual(
+        work_id="queue-clean-a",
+        schema_key=schema.schema_key,
+        scores={"story_fit": 8, "craft": 8, "emotional_pull": 8},
+        status=EvaluationStatus.COMPLETE,
+    )
+
+    cleaned = container.queue_service.clean_queue_schema_slot(work_set.id, schema.schema_key)
+
+    assert cleaned.ok
+    archived = container.batch_repo.get(batch.id)
+    assert archived is not None
+    assert archived.status is EvaluationBatchStatus.ARCHIVED
+    assert container.queue_repo.list(batch_id=batch.id) == []
+    assert container.queue_service.list_queue_batches(profile.fandom_key) == []
+    evaluated = container.queue_service.list_evaluated_batches(profile.fandom_key)
+    assert len(evaluated) == 1
+    assert evaluated[0].completed_count == 1
+    assert container.evaluation_service.latest_for_work("queue-clean-a", schema.schema_key) is not None
+
+    requeued = container.queue_service.create_queue_for_schema_slot(work_set.id, schema.schema_key)
+
+    assert requeued.ok
+    assert {item.work_id for item in container.queue_repo.list(batch_id=batch.id)} == {"queue-clean-b"}
+    assert container.batch_repo.get(batch.id).status is EvaluationBatchStatus.PARTIAL
+
+
 def test_cluster_metadata_persists_and_favorites_sort_first(tmp_path) -> None:
     container = build_container(tmp_path / "ao3.sqlite")
     profile = container.fandom_service.ensure_default()
@@ -617,6 +663,7 @@ def test_browse_service_builds_fandom_scoped_filter_urls() -> None:
     )
 
     assert url.startswith("https://archiveofourown.org/works?work_search%5Bsort_column%5D=revised_at")
+    assert "work_search%5Bsort_direction%5D=desc" in url
     assert "work_search%5Bquery%5D=overlooked" in url
     assert "commit=Sort+and+Filter" in url
     assert "tag_id=Life+is+Strange+%28Video+Games+2015+2017+2024+2026%29" in url
@@ -636,7 +683,7 @@ def test_browse_service_matches_ao3_filter_parameter_shape() -> None:
         },
     )
 
-    assert "work_search%5Bsort_column%5D=revised_at&include_work_search%5Bcharacter_ids%5D%5B%5D=10872457" in url
+    assert "work_search%5Bsort_column%5D=revised_at&work_search%5Bsort_direction%5D=desc&include_work_search%5Bcharacter_ids%5D%5B%5D=10872457" in url
     assert "&work_search%5Bother_tag_names%5D=&exclude_work_search%5Bcharacter_ids%5D%5B%5D=4149650" in url
     assert "&commit=Sort+and+Filter&tag_id=Life+is+Strange+%28Video+Games+2015+2017+2024+2026%29" in url
 

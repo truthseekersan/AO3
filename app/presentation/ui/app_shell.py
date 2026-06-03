@@ -24,7 +24,18 @@ from app.application.services import (
     short_fandom_name,
     utc_now_iso,
 )
-from app.domain.entities import BrowseSnapshot, Evaluation, EvaluationSchema, FandomProfile, ScoreDimension, ScoreRange, Work, WorkRarity, WorkTag
+from app.domain.entities import (
+    BrowseSnapshot,
+    CharacterProfile,
+    Evaluation,
+    EvaluationSchema,
+    FandomProfile,
+    ScoreDimension,
+    ScoreRange,
+    Work,
+    WorkRarity,
+    WorkTag,
+)
 from app.domain.enums import (
     AuthState,
     EvaluationStatus,
@@ -62,6 +73,17 @@ AO3_LANGUAGE_FILTERS = [
     ("de", "German"),
     ("fr", "French"),
     ("es", "Spanish"),
+]
+AO3_METADATA_SORT_PILLS = [
+    ("revised_at", "Updated"),
+    ("word_count", "Word Count"),
+    ("bookmarks_count", "Bookmarks"),
+    ("kudos_count", "Kudos"),
+    ("hits", "Hits"),
+    ("comments_count", "Comments"),
+    ("authors_to_sort_on", "Creator"),
+    ("title_to_sort_on", "Title"),
+    ("created_at", "Posted"),
 ]
 TAG_TYPE_ORDER = [
     TagType.RATING,
@@ -261,6 +283,7 @@ class AO3StudioShell:
         self.left_container = None
         self.left_footer_container = None
         self.center_container = None
+        self.right_header_container = None
         self.right_container = None
         self.filter_metadata: Any | None = container.preferences_service.get("last_filter_metadata", None)
         self.left_fandom_split = int(container.preferences_service.get("left_fandom_split", 44) or 44)
@@ -268,7 +291,8 @@ class AO3StudioShell:
         self.work_remove_armed_id = ""
         self.queue_cleanup_mode = False
         self.queue_delete_armed = False
-        self.queue_cleanup_selected: set[str] = set()
+        self.queue_cleanup_selected_clusters: set[str] = set()
+        self.queue_cleanup_selected_schemas: set[str] = set()
         self.selected_queue_batch_id = str(container.preferences_service.get("selected_queue_batch_id", "") or "")
         self.selected_evaluated_batch_id = str(container.preferences_service.get("selected_evaluated_batch_id", "") or "")
         self.selected_queue_cluster_id = str(container.preferences_service.get("selected_queue_cluster_id", "") or "")
@@ -341,10 +365,14 @@ class AO3StudioShell:
                                     """,
                                 )
                         with right_splitter.after:
-                            with ui.scroll_area().classes("right-panel-scroll w-full h-full panel-bg"):
-                                self.right_container = ui.column().classes(
-                                    "right-panel-column w-full gap-3 p-3 overflow-x-hidden items-stretch"
-                                ).style("width: 100%; min-width: 100%; max-width: none;")
+                            with ui.column().classes("right-panel-shell w-full h-full min-h-0 panel-bg overflow-hidden gap-0"):
+                                self.right_header_container = ui.row().classes(
+                                    "right-panel-header-strip w-full items-center justify-end gap-1 shrink-0 overflow-hidden"
+                                )
+                                with ui.scroll_area().classes("right-panel-scroll w-full flex-grow min-h-0"):
+                                    self.right_container = ui.column().classes(
+                                        "right-panel-column w-full gap-3 p-3 overflow-x-hidden items-stretch"
+                                    ).style("width: 100%; min-width: 100%; max-width: none;")
         self.refresh()
         ui.timer(0.2, self._prewarm_ao3_browser, once=True)
 
@@ -374,6 +402,7 @@ class AO3StudioShell:
         self._render_left()
         self._render_center()
         self._render_top()
+        self._render_right_header()
         self._render_right()
 
     @staticmethod
@@ -423,6 +452,7 @@ class AO3StudioShell:
         self.container.preferences_service.set("active_page", page)
         self._render_center()
         self._render_top()
+        self._render_right_header()
         self._render_right()
         self._render_left_footer()
 
@@ -480,10 +510,6 @@ class AO3StudioShell:
                     collect_page.on("click.stop", lambda _=None, ids=visible_ids: self._show_save_page_set_dialog(ids))
                     with collect_page:
                         rich_tooltip("Save this page as a named evaluation queue", active.color)
-                elif self.page == "Queue":
-                    ui.label("Evaluation Queue").classes("reader-top-work text-sm font-bold px-2").style(glow_text(active.color, 4))
-                elif self.page == "Evaluated":
-                    ui.label("Evaluated").classes("reader-top-work text-sm font-bold px-2").style(glow_text(active.color, 4))
                 elif self.page == "Read":
                     reader = self._reader_top_context()
                     if reader:
@@ -1024,22 +1050,37 @@ class AO3StudioShell:
         with avatar_btn:
             self._avatar_image(avatar_url, name, color, "34px", "200px")
 
-    def _avatar_image(self, avatar_url: str | None, label: str, color: str, small_size: str, big_size: str) -> None:
+    def _avatar_image(
+        self,
+        avatar_url: str | None,
+        label: str,
+        color: str,
+        small_size: str,
+        big_size: str,
+        *,
+        expand_side: str = "right",
+    ) -> None:
         src = self._avatar_src(avatar_url)
+        tooltip_anchor = "center left" if expand_side == "left" else "center right"
+        tooltip_self = "center right" if expand_side == "left" else "center left"
+        tooltip_props = (
+            f'anchor="{tooltip_anchor}" self="{tooltip_self}" '
+            'transition-show="scale" transition-hide="scale" :delay="0" :hide-delay="0"'
+        )
         if src:
             ui.image(src).classes("rounded-full object-cover").style(f"width:{small_size}; height:{small_size}; {self._styled_border_css(color)}")
-            with ui.tooltip().classes("bg-transparent shadow-none pointer-events-none").props(
-                'anchor="center right" self="center left" transition-show="scale" transition-hide="scale" :delay="0" :hide-delay="0"'
-            ).style("padding: 16px; overflow: visible; width: 232px; height: 232px; box-sizing: border-box; will-change: transform;"):
+            with ui.tooltip().classes("bg-transparent shadow-none pointer-events-none").props(tooltip_props).style(
+                "padding: 16px; overflow: visible; width: 232px; height: 232px; box-sizing: border-box; will-change: transform;"
+            ):
                 ui.image(src).classes("rounded-full object-cover").style(f"width:{big_size}; height:{big_size}; {self._styled_border_css(color)}")
             return
         with ui.element("div").classes("rounded-full flex items-center justify-center").style(
             f"width:{small_size}; height:{small_size}; background: rgba({','.join(str(v) for v in rgb_from_hex(color))},0.20); {self._styled_border_css(color)}"
         ):
             ui.label((label or "?")[:1].upper()).classes("text-sm font-bold").style(f"color: {normalized_label_color(color)};")
-        with ui.tooltip().classes("bg-transparent shadow-none pointer-events-none").props(
-            'anchor="center right" self="center left" transition-show="scale" transition-hide="scale" :delay="0" :hide-delay="0"'
-        ).style("padding: 16px; overflow: visible; width: 232px; height: 232px; box-sizing: border-box; will-change: transform;"):
+        with ui.tooltip().classes("bg-transparent shadow-none pointer-events-none").props(tooltip_props).style(
+            "padding: 16px; overflow: visible; width: 232px; height: 232px; box-sizing: border-box; will-change: transform;"
+        ):
             with ui.element("div").classes("rounded-full flex items-center justify-center").style(
                 f"width:{big_size}; height:{big_size}; background: rgba({','.join(str(v) for v in rgb_from_hex(color))},0.20); {self._styled_border_css(color)}"
             ):
@@ -1988,8 +2029,8 @@ class AO3StudioShell:
                 return
             with ui.scroll_area().classes("center-work-scroll w-full h-full min-h-0"):
                 body = ui.column().classes("w-full min-h-full gap-3 p-3 min-w-0")
-                if self.page == "Queue":
-                    body.on("click", lambda _=None: self._disarm_queue_delete())
+                if self.page in {"Queue", "Evaluated"}:
+                    body.on("click", lambda _=None, m="evaluated" if self.page == "Evaluated" else "queue": self._disarm_cluster_cleanup(m))
                 with body:
                     renderer()
         self._restore_center_scroll_after_render()
@@ -2955,9 +2996,30 @@ class AO3StudioShell:
         except RuntimeError:
             return
 
+    def _render_right_header(self) -> None:
+        if not self.right_header_container:
+            return
+        self.right_header_container.clear()
+        active = self._active_fandom()
+        with self.right_header_container:
+            if self.page == "Queue":
+                header_hit = ui.row().classes("right-panel-header-hit w-full h-full items-center justify-end gap-1")
+                header_hit.on("click", lambda _=None: self._disarm_cluster_cleanup("queue"))
+                with header_hit:
+                    self._render_cluster_cleanup_toolbar("queue", active.color)
+            elif self.page == "Evaluated":
+                header_hit = ui.row().classes("right-panel-header-hit w-full h-full items-center justify-end gap-1")
+                header_hit.on("click", lambda _=None: self._disarm_cluster_cleanup("evaluated"))
+                with header_hit:
+                    self._render_cluster_cleanup_toolbar("evaluated", active.color)
+
     def _render_right(self) -> None:
         if not self.right_container:
             return
+        if self.page in {"Queue", "Evaluated"}:
+            self.right_container.classes(add="right-panel-batch-mode h-full min-h-full gap-0 p-0", remove="gap-3 p-3")
+        else:
+            self.right_container.classes(add="gap-3 p-3", remove="right-panel-batch-mode h-full min-h-full gap-0 p-0")
         self.right_container.clear()
         with self.right_container:
             if self.page == "Browse":
@@ -3023,6 +3085,22 @@ class AO3StudioShell:
                 with apply_btn:
                     rich_tooltip("Search pinned works and Work Sets", active.color)
                 ui.element("div").classes("right-panel-icon-spacer")
+        filter_state = self._cluster_filter_state("works")
+        expanded = bool(self.container.preferences_service.get(f"works_ao3_filter_open:{active.fandom_key}", False))
+        expansion = ui.expansion("AO3 Metadata Filters", icon="tune", value=expanded).classes("w-full filter-expansion soft-panel")
+        expansion.on(
+            "update:model-value",
+            lambda event: self._set_works_metadata_open(self._event_bool(event)),
+        )
+        expansion.style(f"--filter-group-color: {active.color};")
+        if expanded:
+            with expansion:
+                self._render_cluster_filter_panel(
+                    filter_state,
+                    active.color,
+                    search_label="Search works",
+                    apply_tooltip="Apply works metadata filters",
+                )
 
     def _render_reader_side_panel(self) -> None:
         active = self._active_fandom()
@@ -3067,6 +3145,50 @@ class AO3StudioShell:
                 refresh.on("click.stop", lambda _=None, w=work.work_id: self._start_reader_download(w, force=True))
                 with refresh:
                     rich_tooltip("Refresh downloaded reader HTML", refresh_color)
+        self._render_reader_character_pills(active)
+
+    def _render_reader_character_pills(self, active: FandomProfile) -> None:
+        characters = self.container.fandom_service.list_characters(active.fandom_key)
+        if not characters:
+            return
+        selected_id = self._reader_selected_character_id(active.fandom_key, characters)
+        with ui.element("div").classes("soft-panel w-full p-2"):
+            with ui.row().classes("w-full gap-1 flex-wrap items-center reader-character-pill-row"):
+                for character in characters:
+                    selected = character.id == selected_id
+                    pill = ui.element("button").props("type=button").classes(
+                        "work-tag-pill browse-tag-pill reader-character-pill text-[11px]"
+                    )
+                    pill.style(self._filter_pill_style(character.color, selected))
+                    pill.on(
+                        "click",
+                        lambda _=None, c=character: self._set_reader_character_selection(c.id),
+                        js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
+                    )
+                    with pill:
+                        self._avatar_image(character.avatar_url, character.name, character.color, "22px", "200px", expand_side="left")
+                        ui.label(character.name).classes("browse-tag-pill-label reader-character-pill-label")
+                        rich_tooltip("Selected POV tint" if selected else "Select POV tint", character.color)
+
+    def _reader_selected_character_id(self, fandom_key_value: str, characters: list[CharacterProfile] | None = None) -> str:
+        key = f"reader_selected_character:{fandom_key_value}"
+        selected_id = str(self.container.preferences_service.get(key, "") or "")
+        if selected_id and characters is not None and selected_id not in {character.id for character in characters}:
+            self.container.preferences_service.set(key, "")
+            return ""
+        return selected_id
+
+    def _reader_selected_character(self, fandom_key_value: str, characters: list[CharacterProfile]) -> CharacterProfile | None:
+        selected_id = self._reader_selected_character_id(fandom_key_value, characters)
+        return next((character for character in characters if character.id == selected_id), None)
+
+    def _set_reader_character_selection(self, character_id: str) -> None:
+        active = self._active_fandom()
+        key = f"reader_selected_character:{active.fandom_key}"
+        current = str(self.container.preferences_service.get(key, "") or "")
+        self.container.preferences_service.set(key, "" if current == character_id else character_id)
+        self._render_center()
+        self._render_right()
 
     def _render_batch_side_panel(self, mode: str) -> None:
         active = self._active_fandom()
@@ -3086,68 +3208,59 @@ class AO3StudioShell:
                 self._set_schema_selection(mode, selected_cluster.work_set.id, "", "")
                 selected_schema_key = ""
 
-        container = ui.column().classes("w-full gap-2")
-        if evaluated:
-            container.on("click", lambda _=None: self._disarm_evaluated_cleanup())
-        with container:
-            if evaluated:
-                self._render_evaluated_cleanup_toolbar(active.color)
-            with ui.row().classes("w-full gap-1 flex-wrap items-start cluster-pill-row"):
-                if selected_cluster:
-                    self._render_cluster_pill(selected_cluster, mode)
-                elif not clusters:
-                    ui.label("No evaluated clusters yet." if evaluated else "No named queues yet.").classes("text-xs text-gray-500")
+        host = ui.element("div").classes("right-panel-cleanup-host w-full h-full flex-grow")
+        host.on("click", lambda _=None, m=mode: self._disarm_cluster_cleanup(m))
+        with host:
+            with ui.column().classes("right-panel-cleanup-content w-full h-full flex-grow gap-2"):
+                with ui.row().classes("w-full gap-1 flex-wrap items-start cluster-pill-row"):
+                    if selected_cluster:
+                        self._render_cluster_pill(selected_cluster, mode)
+                    elif not clusters:
+                        ui.label("No evaluated clusters yet." if evaluated else "No named queues yet.").classes("text-xs text-gray-500")
+                    else:
+                        for cluster in clusters:
+                            self._render_cluster_pill(cluster, mode)
+                if not selected_cluster:
+                    return
+
+                schema_slots = (
+                    [selected_slot]
+                    if selected_slot and not self._cluster_cleanup_mode(mode)
+                    else selected_cluster.slots
+                )
+                with ui.row().classes("w-full gap-1 flex-wrap items-start schema-slot-row"):
+                    for slot in schema_slots:
+                        if slot:
+                            self._render_schema_slot_pill(slot, mode)
+                if selected_slot:
+                    self._render_selected_schema_status(selected_slot, mode)
+
+                if not selected_slot or not selected_slot.batch:
+                    return
+
+                state = self._cluster_filter_state(mode)
+                if evaluated:
+                    if selected_slot.completed_count > 0:
+                        self._render_evaluated_filter_panel(state, selected_slot.schema.schema_key, self._schema_slot_color(selected_slot, active.color))
                 else:
-                    for cluster in clusters:
-                        self._render_cluster_pill(cluster, mode)
-            if not selected_cluster:
-                return
-
-            schema_slots = (
-                [selected_slot]
-                if selected_slot and not (evaluated and self.evaluated_cleanup_mode)
-                else selected_cluster.slots
-            )
-            with ui.row().classes("w-full gap-1 flex-wrap items-start schema-slot-row"):
-                for slot in schema_slots:
-                    if slot:
-                        self._render_schema_slot_pill(slot, mode)
-            if selected_slot:
-                self._render_selected_schema_status(selected_slot, mode)
-
-            if not selected_slot or not selected_slot.batch:
-                return
-
-            state = self._cluster_filter_state(mode)
-            if evaluated:
-                if selected_slot.completed_count > 0:
-                    self._render_evaluated_filter_panel(state, selected_slot.schema.schema_key, self._schema_slot_color(selected_slot, active.color))
-            else:
-                self._render_cluster_filter_panel(state, "Queue Sort and Filter", active.color)
+                    self._render_cluster_filter_panel(state, active.color)
 
     def _render_cluster_pill(self, summary: Any, mode: str) -> None:
         active = self._active_fandom()
         selected_id = self._selected_cluster_id(mode)
         selected = summary.work_set.id == selected_id
         cleanup_selected = (
-            mode == "evaluated"
-            and self.evaluated_cleanup_mode
-            and not self.selected_evaluated_cluster_id
-            and summary.work_set.id in self.evaluated_cleanup_selected_clusters
+            self._cluster_cleanup_mode(mode)
+            and not self._selected_cluster_id(mode)
+            and summary.work_set.id in self._cleanup_selected_clusters(mode)
         )
         meta = self._cluster_meta(summary.work_set)
         color = "#ef4444" if cleanup_selected else self._cluster_color(summary.work_set, active.color)
-        favorite = bool(meta.get("favorite"))
         selected_class = "cluster-pill-selected" if selected else ""
         pill = ui.element("button").props("type=button").classes(
             f"work-tag-pill browse-tag-pill cluster-pill {selected_class} text-[11px]".strip()
         )
-        selected_style = (
-            "box-shadow: 0 0 0 1px rgba(255,255,255,0.42), 0 0 10px rgba(255,255,255,0.10);"
-            if selected
-            else ""
-        )
-        pill.style(self._tag_pill_style(color, favorite or selected or cleanup_selected) + selected_style)
+        pill.style(self._filter_pill_style(color, selected or cleanup_selected))
         pill.on(
             "click",
             lambda _=None, cid=summary.work_set.id, m=mode: self._handle_cluster_pill_click(m, cid),
@@ -3171,10 +3284,9 @@ class AO3StudioShell:
         )
         cleanup_key = f"{slot.work_set.id}|{slot.schema.schema_key}"
         cleanup_selected = (
-            mode == "evaluated"
-            and self.evaluated_cleanup_mode
-            and self.selected_evaluated_cluster_id == slot.work_set.id
-            and cleanup_key in self.evaluated_cleanup_selected_schemas
+            self._cluster_cleanup_mode(mode)
+            and self._selected_cluster_id(mode) == slot.work_set.id
+            and cleanup_key in self._cleanup_selected_schemas(mode)
         )
         color = "#ef4444" if cleanup_selected else self._schema_slot_color(slot, active.color)
         pill = ui.button(slot.schema.name).props("dense rounded no-caps").classes("filter-favorite-pill schema-slot-pill")
@@ -3233,29 +3345,33 @@ class AO3StudioShell:
             f"{getattr(slot, 'failed_count', 0)} failed"
         )
 
-    def _render_evaluated_cleanup_toolbar(self, color: str) -> None:
-        with ui.row().classes("w-full items-center justify-end gap-1 evaluated-cleanup-toolbar"):
-            if self.evaluated_cleanup_mode:
-                trash_color = "#ef4444" if self.evaluated_cleanup_armed else "#6b7280"
-                trash = ui.button(icon="delete").props("round flat dense size=sm").classes("right-panel-icon-button")
-                trash.style(f"color: {trash_color} !important;")
-                trash.on(
-                    "click",
-                    lambda _=None: self._handle_evaluated_cleanup_trash(),
-                    js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
-                )
-                with trash:
-                    rich_tooltip("Confirm cleanup" if self.evaluated_cleanup_armed else "Arm cleanup", "#ef4444")
-            clean = ui.button(icon="cleaning_services").props("round flat dense size=sm").classes("right-panel-icon-button")
-            clean_color = normalized_label_color(color) if self.evaluated_cleanup_mode else "#6b7280"
-            clean.style(f"color: {clean_color} !important;")
-            clean.on(
-                "click",
-                lambda _=None: self._toggle_evaluated_cleanup_mode(),
+    def _render_cluster_cleanup_toolbar(self, mode: str, color: str) -> None:
+        cleanup_mode = self._cluster_cleanup_mode(mode)
+        armed = self._cluster_cleanup_armed(mode)
+        if cleanup_mode:
+            trash_color = "#ef4444" if armed else "#6b7280"
+            trash = ui.button(icon="delete").props("round flat dense size=md").classes("top-action-button")
+            trash.style(f"color: {trash_color} !important;")
+            trash.on(
+                "click.stop",
+                lambda _=None, m=mode: self._handle_cluster_cleanup_trash(m),
                 js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
             )
-            with clean:
-                rich_tooltip("Exit cleanup mode" if self.evaluated_cleanup_mode else "Cleanup evaluated clusters or schema slots", color)
+            with trash:
+                rich_tooltip("Confirm cleanup" if armed else "Arm cleanup", "#ef4444")
+        clean = ui.button(icon="cleaning_services").props("round flat dense size=md").classes("top-action-button")
+        clean_color = normalized_label_color(color) if cleanup_mode else "#6b7280"
+        clean.style(f"color: {clean_color} !important;")
+        clean.on(
+            "click.stop",
+            lambda _=None, m=mode: self._toggle_cluster_cleanup_mode(m),
+            js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
+        )
+        with clean:
+            rich_tooltip(
+                "Exit cleanup mode" if cleanup_mode else f"Cleanup {'evaluated' if mode == 'evaluated' else 'queue'} clusters or schema slots",
+                color,
+            )
 
     def _open_cluster_action_dialog(self, summary: Any, mode: str) -> None:
         active = self._active_fandom()
@@ -3328,19 +3444,28 @@ class AO3StudioShell:
                 save_btn.style(f"background-color: {dark_button_color(color)} !important; color: white;")
         dialog.open()
 
-    def _render_cluster_filter_panel(self, state: dict[str, Any], title: str, color: str) -> None:
+    def _render_cluster_filter_panel(
+        self,
+        state: dict[str, Any],
+        color: str,
+        *,
+        search_label: str = "Search cluster",
+        apply_tooltip: str = "Apply local cluster filters",
+    ) -> None:
         with ui.element("div").classes("soft-panel w-full p-3"):
-            ui.label(title).classes("text-base font-bold").style(glow_text(color, 4))
-            with ui.row().classes("w-full items-center gap-1 flex-nowrap mt-2"):
-                query = ui.input("Search cluster", value=state["query"]).bind_value(state, "query").props(
+            self._segmented_cluster_pills("", state, "sort_dir", [("desc", "Desc"), ("asc", "Asc")], color)
+            with ui.row().classes("w-full items-center gap-1 flex-nowrap"):
+                query = ui.input(search_label, value=state["query"]).bind_value(state, "query").props(
                     "outlined dense dark clearable hide-bottom-space"
                 ).classes("flex-grow min-w-0")
-                query.on("keydown.enter", lambda _=None: self._apply_cluster_filters(state))
-                apply_btn = ui.button(icon="filter_alt", on_click=lambda _=None: self._apply_cluster_filters(state)).props("round dense")
-                apply_btn.classes("shrink-0")
-                apply_btn.style(f"background-color: {dark_button_color(color)} !important; color: white;")
+                query.on("keydown.enter", lambda _=None: self._apply_cluster_filters(state, sort_mode="ao3"))
+                apply_btn = ui.button(icon="refresh", on_click=lambda _=None: self._apply_cluster_filters(state, sort_mode="ao3")).props(
+                    "round flat dense"
+                )
+                apply_btn.classes("right-panel-icon-button shrink-0")
+                apply_btn.style(f"color: {normalized_label_color(color)} !important;")
                 with apply_btn:
-                    rich_tooltip("Apply local cluster filters", color)
+                    rich_tooltip(apply_tooltip, color)
             self._render_cluster_sort_pills(state, color)
             with ui.row().classes("w-full gap-1 filter-two-col-row"):
                 ui.input("Words from", value=state["words_from"]).bind_value(state, "words_from").props(
@@ -3353,12 +3478,20 @@ class AO3StudioShell:
     def _render_evaluated_filter_panel(self, state: dict[str, Any], schema_key: str, color: str) -> None:
         schema = self.container.schema_repo.get(schema_key) or self.container.schema_service.active_schema()
         with ui.element("div").classes("soft-panel w-full p-3"):
-            ui.label("Evaluation Sort and Filter").classes("text-base font-bold").style(glow_text(color, 4))
+            self._segmented_cluster_pills("", state, "score_dir", [("desc", "High"), ("asc", "Low")], color)
             options = {"": "Any score"}
             options.update({dimension.key: dimension.label for dimension in schema.dimensions})
-            ui.select(options, value=state.get("score_key") or "", label="Score").bind_value(state, "score_key").props(
-                "dense dark outlined hide-bottom-space"
-            ).classes("w-full mt-2")
+            with ui.row().classes("w-full items-center gap-1 flex-nowrap"):
+                ui.select(options, value=state.get("score_key") or "", label="Score").bind_value(state, "score_key").props(
+                    "dense dark outlined hide-bottom-space"
+                ).classes("flex-grow min-w-0")
+                apply_btn = ui.button(icon="refresh", on_click=lambda _=None: self._apply_cluster_filters(state, sort_mode="score")).props(
+                    "round flat dense"
+                )
+                apply_btn.classes("right-panel-icon-button shrink-0")
+                apply_btn.style(f"color: {normalized_label_color(color)} !important;")
+                with apply_btn:
+                    rich_tooltip("Apply evaluated score filters", color)
             with ui.row().classes("w-full gap-1 filter-two-col-row"):
                 ui.input("Min", value=state["score_min"]).bind_value(state, "score_min").props(
                     "outlined dense dark clearable hide-bottom-space"
@@ -3366,11 +3499,6 @@ class AO3StudioShell:
                 ui.input("Max", value=state["score_max"]).bind_value(state, "score_max").props(
                     "outlined dense dark clearable hide-bottom-space"
                 ).classes("filter-half-field")
-            self._segmented_cluster_pills("Order", state, "score_dir", [("desc", "High"), ("asc", "Low")], color)
-            apply_btn = ui.button(icon="filter_alt", on_click=lambda _=None: self._apply_cluster_filters(state)).props("round dense")
-            apply_btn.style(f"background-color: {dark_button_color(color)} !important; color: white;")
-            with apply_btn:
-                rich_tooltip("Apply evaluated score filters", color)
 
         expanded = bool(self.container.preferences_service.get(f"evaluated_ao3_filter_open:{self._active_fandom().fandom_key}", False))
         expansion = ui.expansion("AO3 Metadata Filters", icon="tune", value=expanded).classes("w-full filter-expansion soft-panel")
@@ -3381,28 +3509,19 @@ class AO3StudioShell:
         expansion.style(f"--filter-group-color: {color};")
         if expanded:
             with expansion:
-                self._render_cluster_filter_panel(state, "Local AO3 Sort and Filter", color)
+                self._render_cluster_filter_panel(state, color)
 
     def _render_cluster_sort_pills(self, state: dict[str, Any], color: str) -> None:
-        options = [
-            ("revised_at", "Updated"),
-            ("created_at", "Posted"),
-            ("hits", "Hits"),
-            ("kudos_count", "Kudos"),
-            ("word_count", "Words"),
-            ("bookmarks_count", "Bookmarks"),
-            ("title_to_sort_on", "Title"),
-        ]
         with ui.row().classes("w-full gap-1 flex-wrap filter-sort-row mt-2"):
-            for value, label in options:
+            for value, label in AO3_METADATA_SORT_PILLS:
                 selected = str(state.get("sort_column") or "") == value
                 pill = ui.button(label, on_click=lambda _=None, v=value: self._set_cluster_sort(state, v)).props("dense rounded")
                 pill.style(self._filter_pill_style(color, selected))
-        self._segmented_cluster_pills("Direction", state, "sort_dir", [("desc", "Desc"), ("asc", "Asc")], color)
 
     def _segmented_cluster_pills(self, label: str, state: dict[str, Any], key: str, options: list[tuple[str, str]], color: str) -> None:
-        with ui.row().classes("w-full gap-1 flex-wrap items-center filter-segmented-row"):
-            ui.label(label).classes("text-xs text-gray-500 w-full")
+        with ui.row().classes("w-full gap-1 flex-wrap items-center filter-segmented-row cluster-filter-segmented-row"):
+            if label:
+                ui.label(label).classes("text-xs text-gray-500 w-full")
             for value, text in options:
                 selected = str(state.get(key) or "") == value
                 pill = ui.button(text, on_click=lambda _=None, k=key, v=value: self._set_cluster_scalar(state, k, v)).props("dense rounded")
@@ -3412,31 +3531,29 @@ class AO3StudioShell:
         state = self._browse_filter_state()
         metadata = self.filter_metadata or self.container.preferences_service.get("last_filter_metadata", None)
         active = self._active_fandom()
-        with ui.element("div").classes("soft-panel w-full p-2 right-panel-search"):
-            with ui.element("div").classes("right-panel-control-row right-panel-two-icon-grid"):
-                search = ui.input("Search within results", value=state["query"]).bind_value(state, "query").props(
-                    "outlined dense dark clearable hide-bottom-space"
-                ).classes("right-panel-main-field min-w-0")
-                search.on("keydown.enter", lambda: self._start_apply_fandom_filters(state))
-                refresh = ui.button(icon="refresh", on_click=lambda: self._start_apply_fandom_filters(state)).props("round flat dense")
-                refresh.classes("right-panel-icon-button")
-                refresh.style(f"color: {normalized_label_color(active.color)} !important;")
-                with refresh:
-                    rich_tooltip("Apply search and filters", active.color)
-                open_btn = ui.button(icon="open_in_new", on_click=lambda: self._open_ao3_account_session(state)).props("round flat dense")
-                open_btn.classes("right-panel-icon-button")
-                open_btn.style(f"color: {normalized_label_color(active.color)} !important;")
-                with open_btn:
-                    rich_tooltip("Open current AO3 page in your browser", active.color)
-
-        with ui.element("div").classes("soft-panel w-full p-3"):
-            with ui.row().classes("w-full items-center justify-between"):
-                ui.label("Sort and Filter").classes("text-base font-bold").style(glow_text(active.color, 4))
-                save_defaults = ui.button(icon="save").props("round flat dense")
-                save_defaults.style(f"color: {normalized_label_color(active.color)} !important;")
-                save_defaults.on("click.stop", lambda _=None: self._save_current_filter_defaults(state))
-                with save_defaults:
-                    rich_tooltip("Save current filters as this fandom's defaults", active.color)
+        with ui.element("div").classes("soft-panel w-full p-2"):
+            with ui.element("div").classes("right-panel-search w-full"):
+                with ui.element("div").classes("right-panel-control-row right-panel-three-icon-grid"):
+                    search = ui.input("Search within results", value=state["query"]).bind_value(state, "query").props(
+                        "outlined dense dark clearable hide-bottom-space"
+                    ).classes("right-panel-main-field min-w-0")
+                    search.on("keydown.enter", lambda: self._start_apply_fandom_filters(state))
+                    refresh = ui.button(icon="refresh", on_click=lambda: self._start_apply_fandom_filters(state)).props("round flat dense")
+                    refresh.classes("right-panel-icon-button")
+                    refresh.style(f"color: {normalized_label_color(active.color)} !important;")
+                    with refresh:
+                        rich_tooltip("Apply search and filters", active.color)
+                    save_defaults = ui.button(icon="save").props("round flat dense")
+                    save_defaults.classes("right-panel-icon-button")
+                    save_defaults.style(f"color: {normalized_label_color(active.color)} !important;")
+                    save_defaults.on("click.stop", lambda _=None: self._save_current_filter_defaults(state))
+                    with save_defaults:
+                        rich_tooltip("Save current filters as this fandom's defaults", active.color)
+                    open_btn = ui.button(icon="open_in_new", on_click=lambda: self._open_ao3_account_session(state)).props("round flat dense")
+                    open_btn.classes("right-panel-icon-button")
+                    open_btn.style(f"color: {normalized_label_color(active.color)} !important;")
+                    with open_btn:
+                        rich_tooltip("Open current AO3 page in your browser", active.color)
             self._render_sort_pills(metadata, state, active.color)
             with ui.row().classes("w-full gap-1 items-center filter-page-row"):
                 prev_btn = ui.button(icon="chevron_left", on_click=lambda: self._turn_page(state, -1)).props("round flat dense")
@@ -3455,11 +3572,7 @@ class AO3StudioShell:
                         down = ui.button(icon="keyboard_arrow_down").props("flat dense round")
                         down.on("click.stop", lambda _=None, p=page: self._nudge_page_input(state, p, -1))
                         self._attach_page_spin_repeat(down)
-                ui.space()
-                apply_btn = ui.button(icon="filter_alt", on_click=lambda: self._start_apply_fandom_filters(state)).props("round dense")
-                apply_btn.style(f"background-color: {dark_button_color(active.color)} !important; color: white;")
-                with apply_btn:
-                    rich_tooltip("Apply filters", active.color)
+                self._render_browse_sort_direction_pills(state, active.color)
             self._render_favorite_filter_pills(metadata, state)
             self._render_filter_groups(metadata, state, "include")
             self._render_filter_groups(metadata, state, "exclude")
@@ -3474,6 +3587,7 @@ class AO3StudioShell:
             state.update(stored)
         state["fandom"] = self.container.browse_service.resolve_fandom(str(state.get("fandom") or active.tag)) or active.tag
         state["sort_column"] = normalize_ao3_sort_column(state.get("sort_column"))
+        state["sort_direction"] = "asc" if str(state.get("sort_direction")) == "asc" else "desc"
         if not isinstance(state.get("selected"), dict):
             state["selected"] = {}
         if not isinstance(state.get("favorite_options"), list):
@@ -3492,6 +3606,7 @@ class AO3StudioShell:
     def _persist_browse_state(self, state: dict[str, Any]) -> None:
         state["fandom"] = self.container.browse_service.resolve_fandom(str(state.get("fandom") or "")) or DEFAULT_FANDOM
         state["sort_column"] = normalize_ao3_sort_column(state.get("sort_column"))
+        state["sort_direction"] = "asc" if str(state.get("sort_direction")) == "asc" else "desc"
         try:
             state["page"] = max(1, int(float(state.get("page") or 1)))
         except (TypeError, ValueError):
@@ -3534,12 +3649,17 @@ class AO3StudioShell:
             "score_min": "",
             "score_max": "",
             "score_dir": "desc",
+            "sort_mode": "",
         }
+        stored_has_sort_mode = isinstance(stored, dict) and "sort_mode" in stored
         if isinstance(stored, dict):
             state.update(stored)
         state["sort_column"] = normalize_ao3_sort_column(state.get("sort_column"))
         state["sort_dir"] = "asc" if str(state.get("sort_dir")) == "asc" else "desc"
         state["score_dir"] = "asc" if str(state.get("score_dir")) == "asc" else "desc"
+        state["sort_mode"] = str(state.get("sort_mode") or "").strip()
+        if state["sort_mode"] not in {"ao3", "score"}:
+            state["sort_mode"] = "score" if mode == "evaluated" and str(state.get("score_key") or "") and not stored_has_sort_mode else "ao3"
         for key_name in ["query", "words_from", "words_to", "score_key", "score_min", "score_max"]:
             state[key_name] = str(state.get(key_name) or "")
         return state
@@ -3548,28 +3668,61 @@ class AO3StudioShell:
         active_key = self._active_fandom().fandom_key
         key = f"{mode}_cluster_filter_state:{active_key}"
         state["sort_column"] = normalize_ao3_sort_column(state.get("sort_column"))
+        state["sort_mode"] = str(state.get("sort_mode") or "ao3") if mode == "evaluated" else "ao3"
+        if state["sort_mode"] not in {"ao3", "score"}:
+            state["sort_mode"] = "ao3"
         state["words_from"] = normalize_word_count_filter(state.get("words_from"))
         state["words_to"] = normalize_word_count_filter(state.get("words_to"))
         self.container.preferences_service.set(key, dict(state))
 
-    def _apply_cluster_filters(self, state: dict[str, Any]) -> None:
-        mode = "evaluated" if self.page == "Evaluated" else "queue"
+    def _apply_cluster_filters(self, state: dict[str, Any], sort_mode: str | None = None) -> None:
+        mode = "evaluated" if self.page == "Evaluated" else "works" if self.page == "Works" else "queue"
+        if sort_mode:
+            state["sort_mode"] = sort_mode
         self._persist_cluster_filter_state(mode, state)
         self._render_center()
         self._render_right()
 
     def _set_cluster_sort(self, state: dict[str, Any], value: str) -> None:
         state["sort_column"] = normalize_ao3_sort_column(value)
-        self._apply_cluster_filters(state)
+        self._apply_cluster_filters(state, sort_mode="ao3")
 
     def _set_cluster_scalar(self, state: dict[str, Any], key: str, value: str) -> None:
         state[key] = value
-        self._apply_cluster_filters(state)
+        sort_mode = "score" if key == "score_dir" else "ao3" if key == "sort_dir" else None
+        self._apply_cluster_filters(state, sort_mode=sort_mode)
 
     def _set_evaluated_metadata_open(self, value: bool) -> None:
         self.container.preferences_service.set(f"evaluated_ao3_filter_open:{self._active_fandom().fandom_key}", bool(value))
         if self.page == "Evaluated":
             self._render_right()
+
+    def _set_works_metadata_open(self, value: bool) -> None:
+        self.container.preferences_service.set(f"works_ao3_filter_open:{self._active_fandom().fandom_key}", bool(value))
+        if self.page == "Works":
+            self._render_right()
+
+    def _cluster_cleanup_mode(self, mode: str) -> bool:
+        return self.evaluated_cleanup_mode if mode == "evaluated" else self.queue_cleanup_mode
+
+    def _cluster_cleanup_armed(self, mode: str) -> bool:
+        return self.evaluated_cleanup_armed if mode == "evaluated" else self.queue_delete_armed
+
+    def _set_cluster_cleanup_armed(self, mode: str, value: bool) -> None:
+        if mode == "evaluated":
+            self.evaluated_cleanup_armed = value
+        else:
+            self.queue_delete_armed = value
+
+    def _cleanup_selected_clusters(self, mode: str) -> set[str]:
+        return self.evaluated_cleanup_selected_clusters if mode == "evaluated" else self.queue_cleanup_selected_clusters
+
+    def _cleanup_selected_schemas(self, mode: str) -> set[str]:
+        return self.evaluated_cleanup_selected_schemas if mode == "evaluated" else self.queue_cleanup_selected_schemas
+
+    def _clear_cluster_cleanup_selection(self, mode: str) -> None:
+        self._cleanup_selected_clusters(mode).clear()
+        self._cleanup_selected_schemas(mode).clear()
 
     def _set_schema_selection(self, mode: str, work_set_id: str, schema_key: str, batch_id: str = "") -> None:
         if mode == "evaluated":
@@ -3584,6 +3737,7 @@ class AO3StudioShell:
             self.selected_queue_cluster_id = work_set_id
             self.selected_queue_schema_key = schema_key
             self.selected_queue_batch_id = batch_id
+            self.queue_delete_armed = False
             self.container.preferences_service.set("selected_queue_cluster_id", work_set_id)
             self.container.preferences_service.set("selected_queue_schema_key", schema_key)
             self.container.preferences_service.set("selected_queue_batch_id", batch_id)
@@ -3610,12 +3764,14 @@ class AO3StudioShell:
         self._render_right()
 
     def _handle_cluster_pill_click(self, mode: str, work_set_id: str) -> None:
-        if mode == "evaluated" and self.evaluated_cleanup_mode and not self.selected_evaluated_cluster_id:
-            self.evaluated_cleanup_armed = False
-            if work_set_id in self.evaluated_cleanup_selected_clusters:
-                self.evaluated_cleanup_selected_clusters.remove(work_set_id)
+        if self._cluster_cleanup_mode(mode) and not self._selected_cluster_id(mode):
+            self._set_cluster_cleanup_armed(mode, False)
+            selected_clusters = self._cleanup_selected_clusters(mode)
+            if work_set_id in selected_clusters:
+                selected_clusters.remove(work_set_id)
             else:
-                self.evaluated_cleanup_selected_clusters.add(work_set_id)
+                selected_clusters.add(work_set_id)
+            self._render_right_header()
             self._render_right()
             return
         current = self._selected_cluster_id(mode)
@@ -3626,15 +3782,18 @@ class AO3StudioShell:
         self._render_center()
         self._render_right()
         self._render_top()
+        self._render_right_header()
 
     def _handle_schema_slot_click(self, mode: str, slot: Any) -> None:
-        if mode == "evaluated" and self.evaluated_cleanup_mode and self.selected_evaluated_cluster_id == slot.work_set.id:
-            self.evaluated_cleanup_armed = False
+        if self._cluster_cleanup_mode(mode) and self._selected_cluster_id(mode) == slot.work_set.id:
+            self._set_cluster_cleanup_armed(mode, False)
             key = f"{slot.work_set.id}|{slot.schema.schema_key}"
-            if key in self.evaluated_cleanup_selected_schemas:
-                self.evaluated_cleanup_selected_schemas.remove(key)
+            selected_schemas = self._cleanup_selected_schemas(mode)
+            if key in selected_schemas:
+                selected_schemas.remove(key)
             else:
-                self.evaluated_cleanup_selected_schemas.add(key)
+                selected_schemas.add(key)
+            self._render_right_header()
             self._render_right()
             return
         current_cluster = self._selected_cluster_id(mode)
@@ -3646,6 +3805,7 @@ class AO3StudioShell:
         self._render_center()
         self._render_right()
         self._render_top()
+        self._render_right_header()
 
     def _requeue_work_set_under_schema(self, work_set_id: str, schema_key: str) -> None:
         result = self.container.queue_service.requeue_work_set_under_schema(work_set_id, schema_key)
@@ -3656,55 +3816,72 @@ class AO3StudioShell:
         self._notify(result.message, "positive" if result.ok else "negative")
         self.refresh()
 
-    def _toggle_evaluated_cleanup_mode(self) -> None:
-        self.evaluated_cleanup_mode = not self.evaluated_cleanup_mode
-        self.evaluated_cleanup_armed = False
-        self.evaluated_cleanup_selected_clusters.clear()
-        self.evaluated_cleanup_selected_schemas.clear()
+    def _toggle_cluster_cleanup_mode(self, mode: str) -> None:
+        if mode == "evaluated":
+            self.evaluated_cleanup_mode = not self.evaluated_cleanup_mode
+            self.evaluated_cleanup_armed = False
+        else:
+            self.queue_cleanup_mode = not self.queue_cleanup_mode
+            self.queue_delete_armed = False
+        self._clear_cluster_cleanup_selection(mode)
+        self._render_right_header()
         self._render_right()
 
-    def _disarm_evaluated_cleanup(self) -> None:
-        if not self.evaluated_cleanup_armed:
+    def _disarm_cluster_cleanup(self, mode: str) -> None:
+        if not self._cluster_cleanup_armed(mode):
             return
-        self.evaluated_cleanup_armed = False
+        self._set_cluster_cleanup_armed(mode, False)
+        self._render_right_header()
         self._render_right()
 
-    def _handle_evaluated_cleanup_trash(self) -> None:
-        if not self.evaluated_cleanup_mode:
+    def _handle_cluster_cleanup_trash(self, mode: str) -> None:
+        if not self._cluster_cleanup_mode(mode):
             return
-        if self.selected_evaluated_cluster_id:
-            selected = list(self.evaluated_cleanup_selected_schemas)
+        if self._selected_cluster_id(mode):
+            selected = list(self._cleanup_selected_schemas(mode))
             if not selected:
                 self._notify("Select schema pills to clean.", "warning")
                 return
         else:
-            selected = list(self.evaluated_cleanup_selected_clusters)
+            selected = list(self._cleanup_selected_clusters(mode))
             if not selected:
-                self._notify("Select evaluated clusters to clean.", "warning")
+                self._notify(f"Select {'evaluated' if mode == 'evaluated' else 'queue'} clusters to clean.", "warning")
                 return
-        if not self.evaluated_cleanup_armed:
-            self.evaluated_cleanup_armed = True
+        if not self._cluster_cleanup_armed(mode):
+            self._set_cluster_cleanup_armed(mode, True)
+            self._render_right_header()
             self._render_right()
             return
-        if self.selected_evaluated_cluster_id:
+        if self._selected_cluster_id(mode):
             messages: list[str] = []
             for key in selected:
                 work_set_id, schema_key = key.split("|", 1)
-                result = self.container.queue_service.clean_evaluated_schema_slot(work_set_id, schema_key)
+                result = (
+                    self.container.queue_service.clean_evaluated_schema_slot(work_set_id, schema_key)
+                    if mode == "evaluated"
+                    else self.container.queue_service.clean_queue_schema_slot(work_set_id, schema_key)
+                )
                 messages.append(result.message)
-            current_key = f"{self.selected_evaluated_cluster_id}|{self.selected_evaluated_schema_key}"
+            current_key = f"{self._selected_cluster_id(mode)}|{self._selected_schema_key(mode)}"
             if current_key in selected:
-                self._set_schema_selection("evaluated", self.selected_evaluated_cluster_id, self.selected_evaluated_schema_key, "")
+                self._set_schema_selection(mode, self._selected_cluster_id(mode), self._selected_schema_key(mode), "")
             self._notify(messages[-1] if messages else "Schema cleanup complete.", "positive")
         else:
-            result = self.container.queue_service.clean_evaluated_clusters(selected)
+            result = (
+                self.container.queue_service.clean_evaluated_clusters(selected)
+                if mode == "evaluated"
+                else self.container.queue_service.clean_queue_clusters(selected)
+            )
             self._notify(result.message, "positive" if result.ok else "negative")
-            if self.selected_evaluated_cluster_id in selected:
-                self._set_schema_selection("evaluated", "", "", "")
-        self.evaluated_cleanup_mode = False
-        self.evaluated_cleanup_armed = False
-        self.evaluated_cleanup_selected_clusters.clear()
-        self.evaluated_cleanup_selected_schemas.clear()
+            if self._selected_cluster_id(mode) in selected:
+                self._set_schema_selection(mode, "", "", "")
+        if mode == "evaluated":
+            self.evaluated_cleanup_mode = False
+            self.evaluated_cleanup_armed = False
+        else:
+            self.queue_cleanup_mode = False
+            self.queue_delete_armed = False
+        self._clear_cluster_cleanup_selection(mode)
         self._invalidate_browse_page_model()
         self.refresh()
 
@@ -3847,8 +4024,9 @@ class AO3StudioShell:
 
         filtered = [work for work in works if matches(work)]
         sort_column = normalize_ao3_sort_column(state.get("sort_column"))
+        sort_mode = str(state.get("sort_mode") or "ao3")
         reverse = str(state.get("sort_dir") or "desc") != "asc"
-        if mode == "evaluated" and score_key:
+        if mode == "evaluated" and score_key and sort_mode == "score":
             reverse = str(state.get("score_dir") or "desc") != "asc"
 
             def score_key_fn(work: Work) -> tuple[float, str]:
@@ -3886,7 +4064,7 @@ class AO3StudioShell:
         if sort_column == "authors_to_sort_on":
             return (work.author_name or "").casefold()
         if sort_column == "created_at":
-            return work.published_at or ""
+            return AO3StudioShell._work_sort_date(work.published_at or work.last_scraped_at)
         if sort_column == "hits":
             return work.hits or 0
         if sort_column == "kudos_count":
@@ -3897,7 +4075,29 @@ class AO3StudioShell:
             return work.comments or 0
         if sort_column == "word_count":
             return work.words or 0
-        return work.last_ao3_updated_at or work.last_scraped_at or ""
+        return AO3StudioShell._work_sort_date(work.last_ao3_updated_at or work.published_at or work.last_scraped_at)
+
+    @staticmethod
+    def _work_sort_date(value: str | None) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        cleaned = re.sub(r"\s+", " ", raw.replace(",", " ").strip())
+        formats = [
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d",
+            "%d %b %Y",
+            "%d %B %Y",
+            "%b %d %Y",
+            "%B %d %Y",
+        ]
+        for fmt in formats:
+            try:
+                return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                continue
+        return cleaned
 
     def _store_filter_metadata(self, metadata: Any) -> None:
         if not metadata:
@@ -3926,26 +4126,28 @@ class AO3StudioShell:
         ]
 
     def _render_sort_pills(self, metadata: Any, state: dict[str, Any], color: str) -> None:
-        sort_options = self._metadata_options(metadata, "sort_options") or [
-            {"label": "Updated", "value": "revised_at"},
-            {"label": "Posted", "value": "created_at"},
-            {"label": "Hits", "value": "hits"},
-            {"label": "Kudos", "value": "kudos_count"},
-            {"label": "Words", "value": "word_count"},
-            {"label": "Bookmarks", "value": "bookmarks_count"},
-        ]
         current = normalize_ao3_sort_column(state.get("sort_column"))
         state["sort_column"] = current
-        with ui.row().classes("w-full gap-1 flex-wrap filter-sort-row"):
-            for option in sort_options:
-                value = normalize_ao3_sort_column(option.get("value"))
-                label = str(option.get("label") or value).replace("Date ", "")
+        with ui.row().classes("w-full gap-1 flex-wrap filter-sort-row mt-2"):
+            for value, label in AO3_METADATA_SORT_PILLS:
                 selected = value == current
                 pill = ui.button(label, on_click=lambda _=None, v=value: self._set_sort_column(state, v)).props("dense rounded")
                 pill.style(self._filter_pill_style(color, selected))
 
     def _set_sort_column(self, state: dict[str, Any], value: str) -> None:
         state["sort_column"] = normalize_ao3_sort_column(value)
+        self._persist_browse_state(state)
+        self.refresh()
+
+    def _render_browse_sort_direction_pills(self, state: dict[str, Any], color: str) -> None:
+        with ui.row().classes("gap-1 flex-nowrap items-center filter-page-direction-row"):
+            for value, label in [("desc", "Desc"), ("asc", "Asc")]:
+                selected = str(state.get("sort_direction") or "desc") == value
+                pill = ui.button(label, on_click=lambda _=None, v=value: self._set_browse_sort_direction(state, v)).props("dense rounded")
+                pill.style(self._filter_pill_style(color, selected))
+
+    def _set_browse_sort_direction(self, state: dict[str, Any], value: str) -> None:
+        state["sort_direction"] = "asc" if value == "asc" else "desc"
         self._persist_browse_state(state)
         self.refresh()
 
@@ -4997,7 +5199,11 @@ class AO3StudioShell:
                         self._attach_rarity_context_menu(work.work_id, active.color)
                         with ui.scroll_area().classes("reader-panel-scroll w-full h-full flex-grow"):
                             if chapter:
-                                rendered = _reader_highlight_characters(chapter.html, self.container.fandom_service.list_characters(active.fandom_key))
+                                characters = self.container.fandom_service.list_characters(active.fandom_key)
+                                selected_character = self._reader_selected_character(active.fandom_key, characters)
+                                rendered = _reader_highlight_characters(chapter.html, characters)
+                                if selected_character:
+                                    rendered = _reader_apply_pov_paragraph_colors(rendered, selected_character.color)
                                 prose_style = html.escape(self._reader_font_style(style_settings), quote=True)
                                 ui.html(
                                     f'<div class="reader-html-root"><div class="reader-prose" style="{prose_style}">{rendered}</div></div>',
@@ -5161,50 +5367,13 @@ class AO3StudioShell:
         self._invalidate_browse_page_model()
         self.refresh()
 
-    def _toggle_queue_cleanup_mode(self) -> None:
-        self.queue_cleanup_mode = not self.queue_cleanup_mode
-        self.queue_delete_armed = False
-        if not self.queue_cleanup_mode:
-            self.queue_cleanup_selected.clear()
-        self.refresh()
-
-    def _handle_queue_card_click(self, item_id: str) -> None:
-        if self.queue_cleanup_mode:
-            self.queue_delete_armed = False
-            if item_id in self.queue_cleanup_selected:
-                self.queue_cleanup_selected.remove(item_id)
-            else:
-                self.queue_cleanup_selected.add(item_id)
-            self.refresh()
-            return
-        if self.queue_delete_armed or self.queue_cleanup_selected:
-            self.queue_delete_armed = False
-            self.queue_cleanup_selected.clear()
-            self.refresh()
-
-    def _disarm_queue_delete(self) -> None:
-        if self.queue_delete_armed:
-            self.queue_delete_armed = False
-            self.refresh()
-
-    def _handle_queue_trash(self) -> None:
-        if not self.queue_cleanup_selected:
-            return
-        if not self.queue_delete_armed:
-            self.queue_delete_armed = True
-            self.refresh()
-            return
-        deleted = self.container.queue_service.delete_many(list(self.queue_cleanup_selected))
-        self._invalidate_browse_page_model()
-        self.queue_cleanup_selected.clear()
-        self.queue_cleanup_mode = False
-        self.queue_delete_armed = False
-        self._notify(f"Removed {deleted} queue item{'s' if deleted != 1 else ''}.", "positive")
-        self.refresh()
-
     def _page_works(self) -> None:
         model = self._works_page_model_for_current_state()
-        self._render_work_list(model.works, "", render_model=model, lazy_panels=True)
+        works = self._filter_cluster_works(model.works, model, "works")
+        if not works:
+            self._empty("library_books", "No works match these filters")
+            return
+        self._render_work_list(works, "", render_model=model, lazy_panels=True)
 
     def _work_set_expanded(self, set_id: str) -> bool:
         expanded = self.container.preferences_service.get("expanded_work_sets", [])
@@ -8187,6 +8356,47 @@ def _reader_highlight_characters(fragment: str, characters: list[Any]) -> str:
         node.replace_with(*list((replacement.body or replacement).contents))
     body = soup.body or soup
     return str(body.decode_contents())
+
+
+def _reader_apply_pov_paragraph_colors(fragment: str, pov_color: str | None) -> str:
+    if not fragment:
+        return fragment
+    if pov_color and pov_color != "#e0e0e0":
+        color_a = _scriptstudio_lighten_color(pov_color, 0.45)
+        color_b = _scriptstudio_lighten_color(pov_color, 0.65)
+    else:
+        color_a = "#c9d1d9"
+        color_b = "#dde3ea"
+    soup = BeautifulSoup(fragment, "lxml")
+    body = soup.body or soup
+    blocks: list[Any] = []
+    for node in body.find_all(["p", "blockquote", "div"]):
+        if node.name == "div" and node.find(["p", "blockquote", "div"]):
+            continue
+        if node.get_text(" ", strip=True):
+            blocks.append(node)
+    for index, node in enumerate(blocks):
+        color = color_a if index % 2 == 0 else color_b
+        existing = str(node.get("style") or "").strip()
+        separator = "" if not existing or existing.endswith(";") else "; "
+        node["style"] = f"{existing}{separator}color: {color};"
+    return str(body.decode_contents())
+
+
+def _scriptstudio_lighten_color(hex_color: str, amount: float = 0.3) -> str:
+    value = str(hex_color or "").strip().lstrip("#")
+    if len(value) != 6:
+        return str(hex_color or "")
+    try:
+        r = int(value[0:2], 16)
+        g = int(value[2:4], 16)
+        b = int(value[4:6], 16)
+    except ValueError:
+        return str(hex_color or "")
+    r = int(r + (255 - r) * amount)
+    g = int(g + (255 - g) * amount)
+    b = int(b + (255 - b) * amount)
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 IMPACT_OPTIONS = {"0.5": "Low", "1.0": "Normal", "1.5": "High", "2.0": "Critical"}
