@@ -778,20 +778,39 @@ def apply_theme() -> None:
             .reader-character-pill-row {
                 align-content: flex-start;
             }
+            .reader-pov-header-icon {
+                height: 24px !important;
+                min-height: 24px !important;
+                min-width: 24px !important;
+                width: 24px !important;
+            }
             .reader-character-pill {
                 gap: 6px;
+                flex: 0 0 auto;
                 justify-content: flex-start;
+                max-width: none !important;
                 min-height: 28px !important;
+                overflow: visible;
                 padding: 2px 8px 2px 3px !important;
                 transition: filter 0.14s ease, border-color 0.14s ease, background 0.14s ease;
+                white-space: nowrap;
             }
             .reader-character-pill:hover {
                 filter: brightness(1.14);
             }
             .reader-character-pill-label {
-                min-width: 0;
-                max-width: calc(100% - 32px);
+                flex: 0 0 auto;
+                max-width: none !important;
+                min-width: max-content;
+                overflow: visible !important;
+                text-overflow: clip !important;
                 white-space: nowrap;
+            }
+            .reader-no-pov {
+                padding: 2px 8px !important;
+            }
+            .character-profile-expanded {
+                margin-top: 2px;
             }
             .tag-type-label {
                 color: #64748b;

@@ -94,6 +94,7 @@ class CharacterProfile:
     id: str
     fandom_key: str
     name: str
+    full_name: str = ""
     color: str = "#58a6ff"
     avatar_url: str | None = None
     tag_urls: list[str] = field(default_factory=list)

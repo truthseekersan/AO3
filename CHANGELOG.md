@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-06-04
+
+### Changed
+- Refined Read-tab POV handling so `No POV` is a work-level toggle that masks POV across chapters without mutating the per-work POV timeline.
+- Kept Read paragraph rendering on the same tint pipeline for selected POV and `No POV`, preserving the off-white/grey alternating neutral tones.
+
+### Fixed
+- Fixed Read character highlighting so inline character-name spans no longer create nested paragraphs or split AO3 paragraphs visually.
+- Fixed `No POV` toggle behavior so turning it off restores the chapter/work POV timeline state.
+
+### Tests
+- Added regression coverage for work-level `No POV` persistence, POV timeline preservation, neutral paragraph tinting, and AO3 paragraph preservation during character highlighting.
+
 ## 2026-06-03
 
 ### Added

@@ -73,6 +73,10 @@ class SQLiteDatabase:
             if version < 12:
                 self._migrate_v12(conn)
                 conn.execute("PRAGMA user_version = 12")
+                version = 12
+            if version < 13:
+                self._migrate_v13(conn)
+                conn.execute("PRAGMA user_version = 13")
 
     @staticmethod
     def _migrate_v1(conn: sqlite3.Connection) -> None:
@@ -246,6 +250,7 @@ class SQLiteDatabase:
                 id TEXT PRIMARY KEY,
                 fandom_key TEXT NOT NULL,
                 name TEXT NOT NULL,
+                full_name TEXT NOT NULL DEFAULT '',
                 color TEXT NOT NULL DEFAULT '#58a6ff',
                 avatar_url TEXT,
                 tag_urls_json TEXT NOT NULL DEFAULT '[]',
@@ -371,6 +376,8 @@ class SQLiteDatabase:
         }
         if "notes" not in columns:
             conn.execute("ALTER TABLE character_profiles ADD COLUMN notes TEXT")
+        if "full_name" not in columns:
+            conn.execute("ALTER TABLE character_profiles ADD COLUMN full_name TEXT NOT NULL DEFAULT ''")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS reader_assets (
@@ -666,6 +673,16 @@ class SQLiteDatabase:
             "UPDATE evaluation_queue SET schema_key = ? WHERE schema_key IS NULL OR schema_key = ''",
             (schema_key,),
         )
+
+    @staticmethod
+    def _migrate_v13(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(character_profiles)").fetchall()
+        }
+        if "full_name" not in columns:
+            conn.execute("ALTER TABLE character_profiles ADD COLUMN full_name TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE character_profiles SET full_name = name WHERE full_name IS NULL OR full_name = ''")
 
     @staticmethod
     def _stable_batch_id(work_set_id: str, schema_key: str) -> str:

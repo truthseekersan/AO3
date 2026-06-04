@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote, unquote, urlparse
 
 from bs4 import BeautifulSoup, NavigableString
 from nicegui import background_tasks, context, events, run, ui
@@ -1044,9 +1045,20 @@ class AO3StudioShell:
         with avatar_btn:
             content()
 
-    def _character_avatar_button(self, character_id: str, name: str, avatar_url: str | None, color: str) -> None:
+    def _character_avatar_button(
+        self,
+        character_id: str,
+        name: str,
+        avatar_url: str | None,
+        color: str,
+        rerender: Callable[[], None] | None = None,
+        fandom_key_value: str | None = None,
+    ) -> None:
         avatar_btn = ui.button().props("flat round dense").classes("p-0 m-0 relative")
-        avatar_btn.on("click.stop", lambda _=None, cid=character_id, n=name, c=color: self._open_character_avatar_dialog(cid, n, c))
+        avatar_btn.on(
+            "click.stop",
+            lambda _=None, cid=character_id, n=name, c=color, r=rerender, fk=fandom_key_value: self._open_character_avatar_dialog(cid, n, c, r, fk),
+        )
         with avatar_btn:
             self._avatar_image(avatar_url, name, color, "34px", "200px")
 
@@ -1414,7 +1426,7 @@ class AO3StudioShell:
         style_override = self.container.style_service.fandom_override(active.fandom_key)
         style_state = dict(style_override.settings)
         style_enabled = {"enabled": bool(style_override.enabled)}
-        character_draft = {"name": "", "color": draft["color"], "tag_urls": ""}
+        character_draft = {"name": "", "full_name": "", "color": draft["color"], "avatar_url": "", "tag_urls": "", "notes": ""}
         initial_tab = str(self.container.preferences_service.get("fandom_dialog_tab", "Identity") or "Identity")
         if initial_tab not in {"Identity", "Style", "Config", "Characters"}:
             initial_tab = "Identity"
@@ -1426,6 +1438,11 @@ class AO3StudioShell:
         expanded_characters: set[str] = set()
         character_cleanup = {"mode": False, "armed": False, "selected": set()}
 
+        def collapse_character_expansions() -> None:
+            if expanded_characters:
+                expanded_characters.clear()
+                render_character_panel()
+
         def current_color() -> str:
             return str(draft.get("color") or accent or "#58a6ff")
 
@@ -1433,6 +1450,7 @@ class AO3StudioShell:
             value = str(getattr(event, "value", None) or getattr(event, "args", None) or "Identity")
             if value in {"Identity", "Style", "Config", "Characters"}:
                 self.container.preferences_service.set("fandom_dialog_tab", value)
+                collapse_character_expansions()
 
         def close_dialog() -> None:
             ui.run_javascript("if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); }")
@@ -1447,6 +1465,7 @@ class AO3StudioShell:
             return state
 
         def save_fandom() -> None:
+            nonlocal active, is_new, accent
             tag = str(draft["tag"]).strip()
             if not tag:
                 self._notify("Fandom tag is required.", "warning")
@@ -1466,8 +1485,18 @@ class AO3StudioShell:
                 )
             )
             self.container.fandom_service.select(saved.fandom_key)
-            self._select_fandom_profile(saved.fandom_key)
-            close_dialog()
+            active = saved
+            is_new = False
+            accent = saved.color
+            draft["fandom_key"] = saved.fandom_key
+            draft["display_name"] = saved.display_name
+            draft["avatar_url"] = saved.avatar_url or ""
+            self.container.preferences_service.set("active_page", self.page)
+            self._invalidate_browse_page_model()
+            self._notify("Fandom saved.", "positive")
+            render_avatar_slot()
+            render_config_controls()
+            render_character_panel()
 
         def save_fandom_style(state: dict[str, Any]) -> None:
             if is_new:
@@ -1476,7 +1505,6 @@ class AO3StudioShell:
             self.container.style_service.save_fandom_override(active.fandom_key, bool(style_enabled["enabled"]), state)
             self._invalidate_browse_page_model()
             self._notify("Fandom style saved.", "positive")
-            self.refresh()
 
         def render_avatar_slot() -> None:
             slot = refs.get("avatar_slot")
@@ -1583,30 +1611,39 @@ class AO3StudioShell:
 
         def use_suggestion(suggestion, draft: dict[str, Any] | None = None) -> None:
             target = draft or character_draft
-            target["name"] = target.get("name") or suggestion.tag_text
-            if suggestion.tag_url:
-                urls = [url.strip() for url in str(target.get("tag_urls") or "").split(",") if url.strip()]
-                if suggestion.tag_url not in urls:
-                    urls.append(suggestion.tag_url)
-                target["tag_urls"] = ", ".join(urls)
+            source_label = suggestion.tag_url or suggestion.tag_text
+            short_name, full_name = _character_names_from_ao3_label(source_label)
+            target["name"] = short_name or suggestion.tag_text
+            target["full_name"] = full_name or suggestion.tag_text
+            target["tag_urls"] = _canonical_ao3_character_tag_url(source_label)
             render_character_panel()
 
         def save_character_from_draft(draft: dict[str, Any], character_id: str | None = None) -> None:
             if is_new:
                 self._notify("Save the fandom before adding character identities.", "warning")
                 return
+            full_name = str(draft.get("full_name") or "").strip()
+            name = str(draft.get("name") or "").strip()
+            canonical_tag_url = _canonical_ao3_character_tag_url(
+                str(draft.get("tag_urls") or "") or full_name or name
+            )
+            if not full_name:
+                _, full_name = _character_names_from_ao3_label(canonical_tag_url or name)
+            if not name:
+                name, _ = _character_names_from_ao3_label(canonical_tag_url or full_name)
             result = self.container.fandom_service.save_character(
                 fandom_key=active.fandom_key,
                 character_id=character_id,
-                name=str(draft.get("name") or ""),
+                name=name,
+                full_name=full_name,
                 color=str(draft.get("color") or draft["color"]),
                 avatar_url=str(draft.get("avatar_url") or ""),
-                tag_urls=str(draft.get("tag_urls") or "").split(","),
+                tag_urls=[canonical_tag_url] if canonical_tag_url else [],
                 notes=str(draft.get("notes") or ""),
             )
             self._notify(result.message, "positive" if result.ok else "warning")
             if result.ok and character_id is None:
-                character_draft.update({"name": "", "tag_urls": "", "notes": ""})
+                character_draft.update({"name": "", "full_name": "", "tag_urls": "", "notes": ""})
             render_character_panel()
 
         def delete_selected_characters() -> None:
@@ -1656,109 +1693,143 @@ class AO3StudioShell:
                         with refresh:
                             rich_tooltip("Refresh AO3 tags for this fandom", current_color())
                 characters = self.container.fandom_service.list_characters(active.fandom_key)
-                for character in characters:
-                    cr, cg, cb = rgb_from_hex(character.color)
-                    selected = character.id in character_cleanup["selected"]
-                    expanded = character.id in expanded_characters
-                    pill_style = (
-                        f"border-color: rgba({cr},{cg},{cb},{0.76 if expanded else 0.34}); "
-                        f"background: rgba({cr},{cg},{cb},{0.18 if expanded else 0.08});"
-                    )
-                    if selected and character_cleanup["mode"]:
-                        pill_style = "border-color: rgba(239,68,68,0.82); background: rgba(239,68,68,0.32);"
-                    with ui.column().classes("soft-panel w-full gap-2 p-2 cursor-pointer").style(pill_style).on(
-                        "click.stop",
-                        lambda _=None, c=character: (
-                            character_cleanup["selected"].remove(c.id) if character_cleanup["mode"] and c.id in character_cleanup["selected"] else
-                            character_cleanup["selected"].add(c.id) if character_cleanup["mode"] else
-                            expanded_characters.remove(c.id) if c.id in expanded_characters else
-                            expanded_characters.add(c.id),
-                            render_character_panel(),
-                        ),
-                    ):
-                        with ui.row().classes("w-full items-center gap-2"):
-                            self._character_avatar_button(character.id, character.name, character.avatar_url, character.color)
-                            first_name = re.split(r"\s+", character.name.strip(), maxsplit=1)[0] or character.name
-                            ui.label(first_name).classes("text-sm font-bold truncate flex-grow").style(glow_text(character.color, 4))
-                            ui.icon("expand_less" if expanded else "expand_more", size="18px").style(f"color: {normalized_label_color(character.color)};")
-                        if not expanded:
-                            tag_text = ", ".join(character.tag_urls[:2]) or "No AO3 character tags attached"
-                            ui.label(tag_text).classes("text-[11px] text-gray-500 truncate")
-                            continue
-                        draft = {
-                            "name": character.name,
-                            "color": character.color,
-                            "avatar_url": character.avatar_url or "",
-                            "tag_urls": ", ".join(character.tag_urls),
-                            "notes": character.notes or "",
-                        }
-                        with ui.row().classes("w-full items-end gap-2").on("click.stop", lambda _=None: None):
-                            ui.input("Character name", value=draft["name"]).bind_value(draft, "name").props("dark outlined dense clearable").classes("flex-grow")
-                            ui.color_input("Color", value=draft["color"]).bind_value(draft, "color").props("dark outlined dense").classes("w-32")
-                        tag_input = ui.input("AO3 character tags", value=draft["tag_urls"]).bind_value(draft, "tag_urls").props(
-                            "dark outlined dense clearable"
-                        ).classes("w-full").on("click.stop", lambda _=None: None)
-                        ui.textarea("Notes", value=draft["notes"]).bind_value(draft, "notes").props("dark outlined dense rows=2").classes("w-full").on(
-                            "click.stop", lambda _=None: None
-                        )
-                        suggestions_row = ui.row().classes("w-full gap-1 flex-wrap").on("click.stop", lambda _=None: None)
-
-                        def render_edit_suggestions(
-                            ch_draft=draft,
-                            row=suggestions_row,
-                            red=cr,
-                            green=cg,
-                            blue=cb,
-                            char_color=character.color,
-                        ) -> None:
-                            row.clear()
-                            query = str(ch_draft.get("tag_urls") or ch_draft.get("name") or "")
-                            suggestions = self.container.fandom_service.tag_suggestions(active.fandom_key, query, 12, category="character")
-                            with row:
-                                if not suggestions:
-                                    ui.label("Refresh AO3 tag catalog for character-tag suggestions.").classes("text-[11px] text-gray-500")
-                                    return
-                                for suggestion in suggestions:
-                                    pill = ui.button(suggestion.tag_text, on_click=lambda _=None, s=suggestion, d=ch_draft: use_suggestion(s, d)).props(
-                                        "dense rounded flat"
-                                    )
-                                    pill.style(
-                                        f"border: 1px solid rgba({red},{green},{blue},0.32); color: {normalized_label_color(char_color)} !important;"
-                                    )
-                                    with pill:
-                                        rich_tooltip("character", char_color)
-
-                        tag_input.on("update:model-value", lambda _=None: render_edit_suggestions())
-                        render_edit_suggestions()
-                        save_btn = ui.button("Save", icon="save", on_click=lambda _=None, d=draft, cid=character.id: save_character_from_draft(d, cid)).props(
-                            "dense"
-                        )
-                        save_btn.style(f"background-color: {dark_button_color(character.color)} !important; color: white;")
                 if not characters:
                     ui.label("No character colors yet.").classes("text-sm text-gray-500")
+                else:
+                    with ui.row().classes("w-full gap-1 flex-wrap items-center reader-character-pill-row"):
+                        for character in characters:
+                            display_name, _ = _character_profile_display_names(character)
+                            cleanup_selected = character.id in character_cleanup["selected"]
+                            expanded = character.id in expanded_characters
+                            color = "#ef4444" if cleanup_selected and character_cleanup["mode"] else character.color
+                            selected = cleanup_selected if character_cleanup["mode"] else expanded
+                            pill = ui.element("button").props("type=button").classes(
+                                "work-tag-pill browse-tag-pill reader-character-pill character-profile-pill text-[11px]"
+                            )
+                            pill.style(self._filter_pill_style(color, selected))
+                            pill.on(
+                                "click",
+                                lambda _=None, c=character: (
+                                    character_cleanup["selected"].remove(c.id) if character_cleanup["mode"] and c.id in character_cleanup["selected"] else
+                                    character_cleanup["selected"].add(c.id) if character_cleanup["mode"] else
+                                    expanded_characters.remove(c.id) if c.id in expanded_characters else
+                                    expanded_characters.add(c.id),
+                                    render_character_panel(),
+                                ),
+                                js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
+                            )
+                            with pill:
+                                self._avatar_image(character.avatar_url, display_name, character.color, "22px", "200px")
+                                ui.label(display_name).classes("browse-tag-pill-label reader-character-pill-label")
+                                rich_tooltip("Cleanup selected" if cleanup_selected and character_cleanup["mode"] else "Click to edit", color)
+                    for character in characters:
+                        if character.id not in expanded_characters:
+                            continue
+                        display_name, display_full_name = _character_profile_display_names(character)
+                        cr, cg, cb = rgb_from_hex(character.color)
+                        expanded_style = (
+                            f"border: 1px solid rgba({cr},{cg},{cb},0.46); "
+                            f"background: rgba({cr},{cg},{cb},0.11); "
+                            f"box-shadow: 0 0 16px rgba({cr},{cg},{cb},0.12);"
+                        )
+                        draft = {
+                            "name": display_name,
+                            "full_name": display_full_name,
+                            "color": character.color,
+                            "avatar_url": character.avatar_url or "",
+                            "tag_urls": _canonical_ao3_character_tag_url((character.tag_urls or [""])[0] or display_full_name or display_name),
+                            "notes": character.notes or "",
+                        }
+                        with ui.element("div").classes("soft-panel w-full p-2 character-profile-expanded").style(expanded_style).on(
+                            "click.stop",
+                            lambda _=None: None,
+                        ):
+                            with ui.row().classes("w-full items-center gap-2"):
+                                self._character_avatar_button(
+                                    character.id,
+                                    display_name,
+                                    character.avatar_url,
+                                    character.color,
+                                    render_character_panel,
+                                    active.fandom_key,
+                                )
+                                ui.input("Name", value=draft["name"]).bind_value(draft, "name").props(
+                                    "dark outlined dense"
+                                ).classes("w-32")
+                                ui.input("Full Name", value=draft["full_name"]).bind_value(draft, "full_name").props(
+                                    "dark outlined dense"
+                                ).classes("flex-grow")
+                                ui.color_input("Color", value=draft["color"]).bind_value(draft, "color").props("dark outlined dense").classes("w-32")
+                            tag_input = ui.input("Canonical AO3 character tag URL", value=draft["tag_urls"]).bind_value(draft, "tag_urls").props(
+                                "dark outlined dense"
+                            ).classes("w-full")
+                            ui.textarea("Notes", value=draft["notes"]).bind_value(draft, "notes").props("dark outlined dense rows=2").classes("w-full")
+                            suggestions_row = ui.row().classes("w-full gap-1 flex-wrap")
+
+                            def render_edit_suggestions(ch_draft=draft, row=suggestions_row, char_color=character.color) -> None:
+                                row.clear()
+                                query = str(ch_draft.get("tag_urls") or ch_draft.get("full_name") or ch_draft.get("name") or "")
+                                suggestions = _canonical_character_suggestions(
+                                    self.container.fandom_service.tag_suggestions(active.fandom_key, query, 24, category="character"),
+                                    query,
+                                )[:12]
+                                with row:
+                                    if not suggestions:
+                                        ui.label("Refresh AO3 tag catalog for character-tag suggestions.").classes("text-[11px] text-gray-500")
+                                        return
+                                    for suggestion in suggestions:
+                                        suggestion_label = _ao3_character_tag_label(suggestion.tag_url or suggestion.tag_text)
+                                        pill = ui.button(
+                                            suggestion_label,
+                                            on_click=lambda _=None, s=suggestion, d=ch_draft: use_suggestion(s, d),
+                                        ).props("dense rounded flat")
+                                        pill.classes("max-w-full")
+                                        pill.style(
+                                            f"border: 1px solid rgba({','.join(str(v) for v in rgb_from_hex(char_color))},0.32); "
+                                            f"color: {normalized_label_color(char_color)} !important; overflow: hidden; text-overflow: ellipsis;"
+                                        )
+                                        with pill:
+                                            rich_tooltip("character", char_color)
+
+                            tag_input.on("update:model-value", lambda _=None: render_edit_suggestions())
+                            render_edit_suggestions()
+                            with ui.row().classes("w-full justify-end"):
+                                save_btn = ui.button(
+                                    "Save",
+                                    icon="save",
+                                    on_click=lambda _=None, d=draft, cid=character.id: save_character_from_draft(d, cid),
+                                ).props("dense")
+                                save_btn.style(f"background-color: {dark_button_color(character.color)} !important; color: white;")
                 ui.separator().classes("bg-gray-800")
                 with ui.row().classes("w-full gap-2 items-end"):
-                    name_input = ui.input("Character name", value=character_draft["name"]).bind_value(character_draft, "name").props(
-                        "dark outlined dense clearable"
+                    name_input = ui.input("Name", value=character_draft["name"]).bind_value(character_draft, "name").props(
+                        "dark outlined dense"
+                    ).classes("w-36")
+                    full_name_input = ui.input("Full Name", value=character_draft["full_name"]).bind_value(character_draft, "full_name").props(
+                        "dark outlined dense"
                     ).classes("flex-grow")
                     ui.color_input("Color", value=character_draft["color"]).bind_value(character_draft, "color").props("dark outlined dense").classes("w-32")
-                tag_input = ui.input("AO3 tag links, comma separated", value=character_draft["tag_urls"]).bind_value(
+                tag_input = ui.input("Canonical AO3 character tag URL", value=character_draft["tag_urls"]).bind_value(
                     character_draft,
                     "tag_urls",
-                ).props("dark outlined dense clearable").classes("w-full")
+                ).props("dark outlined dense").classes("w-full")
                 suggestions_row = ui.row().classes("w-full gap-1 flex-wrap")
 
                 def render_suggestions() -> None:
                     suggestions_row.clear()
-                    query = str(character_draft["tag_urls"] or character_draft["name"] or "")
-                    suggestions = self.container.fandom_service.tag_suggestions(active.fandom_key, query, 14, category="character")
+                    query = str(character_draft["tag_urls"] or character_draft["full_name"] or character_draft["name"] or "")
+                    suggestions = _canonical_character_suggestions(
+                        self.container.fandom_service.tag_suggestions(active.fandom_key, query, 28, category="character"),
+                        query,
+                    )[:14]
                     with suggestions_row:
                         if not suggestions:
                             ui.label("Refresh AO3 tag catalog for live suggestions.").classes("text-[11px] text-gray-500")
                             return
                         for suggestion in suggestions:
+                            suggestion_label = _ao3_character_tag_label(suggestion.tag_url or suggestion.tag_text)
                             pill = ui.button(
-                                suggestion.tag_text,
+                                suggestion_label,
                                 on_click=lambda _=None, s=suggestion: use_suggestion(s),
                             ).props("dense rounded flat")
                             pill.classes("max-w-full")
@@ -1770,6 +1841,7 @@ class AO3StudioShell:
                                 rich_tooltip(suggestion.category.replace("_", " "), current_color())
 
                 name_input.on("update:model-value", lambda _=None: render_suggestions())
+                full_name_input.on("update:model-value", lambda _=None: render_suggestions())
                 tag_input.on("update:model-value", lambda _=None: render_suggestions())
                 render_suggestions()
                 add_btn = ui.button("Add Character", icon="add", on_click=lambda: save_character_from_draft(character_draft))
@@ -1778,9 +1850,11 @@ class AO3StudioShell:
         dialog = ui.dialog()
         dialog.on("hide", dialog.delete)
         with dialog, ui.card().classes("flex flex-col p-0 gap-0 overflow-hidden").style(base_dialog_style) as card:
-            with ui.row().classes("w-full items-center justify-between p-4 border-b border-gray-700 shrink-0").style(
+            header_row = ui.row().classes("w-full items-center justify-between p-4 border-b border-gray-700 shrink-0").style(
                 "background: rgba(22, 27, 34, 0.75); backdrop-filter: blur(8px);"
-            ):
+            )
+            header_row.on("click", lambda _=None: collapse_character_expansions())
+            with header_row:
                 with ui.row().classes("items-center gap-2 min-w-0"):
                     ui.icon("collections_bookmark", size="sm").style(f"color: {normalized_label_color(accent)};")
                     ui.label("Edit Fandom:").classes("text-lg font-bold text-gray-300")
@@ -1860,15 +1934,40 @@ class AO3StudioShell:
                         refs["config_container"] = ui.column().classes("w-full gap-3")
                         render_config_controls()
                 with ui.tab_panel(characters_tab).classes("w-full h-full p-0"):
-                    with ui.scroll_area().classes("w-full h-full px-4 py-4"):
+                    character_scroll = ui.scroll_area().classes("w-full h-full px-4 py-4")
+                    character_scroll.on(
+                        "click",
+                        lambda _=None: collapse_character_expansions(),
+                        js_handler=(
+                            "(event) => { "
+                            "if (event.target.closest('.character-profile-expanded, .character-profile-pill, "
+                            ".q-field, .q-btn, button, input, textarea, [role=\"button\"]')) return; "
+                            "emit(); "
+                            "}"
+                        ),
+                    )
+                    with character_scroll:
                         refs["character_panel"] = ui.column().classes("w-full gap-3")
                         render_character_panel()
 
-            with ui.row().classes("w-full items-center justify-between p-3 border-t border-gray-700 shrink-0").style(
+            footer_row = ui.row().classes("w-full items-center justify-between p-3 border-t border-gray-700 shrink-0").style(
                 "background: rgba(13, 17, 23, 0.78);"
-            ):
+            )
+            footer_row.on(
+                "click",
+                lambda _=None: collapse_character_expansions(),
+                js_handler=(
+                    "(event) => { "
+                    "if (event.target.closest('.q-btn, button, input, textarea, [role=\"button\"]')) return; "
+                    "emit(); "
+                    "}"
+                ),
+            )
+            with footer_row:
                 ui.label("Changes are local until saved.").classes("text-xs italic text-gray-500")
-                ui.button("Save", icon="save", on_click=lambda: save_fandom()).style(
+                footer_save = ui.button("Save", icon="save")
+                footer_save.on("click.stop", lambda _=None: save_fandom())
+                footer_save.style(
                     f"background-color: {dark_button_color(accent)} !important; color: white;"
                 )
         dialog.open()
@@ -1965,7 +2064,14 @@ class AO3StudioShell:
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Upload failed: {exc}", "negative")
 
-    def _open_character_avatar_dialog(self, character_id: str, name: str, color: str) -> None:
+    def _open_character_avatar_dialog(
+        self,
+        character_id: str,
+        name: str,
+        color: str,
+        rerender: Callable[[], None] | None = None,
+        fandom_key_value: str | None = None,
+    ) -> None:
         dialog = ui.dialog()
         dialog.on("hide", dialog.delete)
         with dialog, ui.card().classes("w-96 p-4 gap-3").style(wash_background(color, 0.14)):
@@ -1975,13 +2081,20 @@ class AO3StudioShell:
                 label="Drop Image Here",
                 auto_upload=True,
                 max_files=1,
-                on_upload=lambda event, cid=character_id, d=dialog: self._handle_character_avatar_upload(event, cid, d),
+                on_upload=lambda event, cid=character_id, d=dialog, r=rerender, fk=fandom_key_value: self._handle_character_avatar_upload(event, cid, d, r, fk),
             ).props('accept="image/*" flat bordered').classes("w-full")
         dialog.open()
 
-    async def _handle_character_avatar_upload(self, event: events.UploadEventArguments, character_id: str, dialog) -> None:
-        active = self._active_fandom()
-        characters = self.container.fandom_service.list_characters(active.fandom_key)
+    async def _handle_character_avatar_upload(
+        self,
+        event: events.UploadEventArguments,
+        character_id: str,
+        dialog,
+        rerender: Callable[[], None] | None = None,
+        fandom_key_value: str | None = None,
+    ) -> None:
+        active_key = str(fandom_key_value or self._active_fandom().fandom_key)
+        characters = self.container.fandom_service.list_characters(active_key)
         character = next((item for item in characters if item.id == character_id), None)
         if not character:
             self._notify("Character not found.", "negative")
@@ -1993,14 +2106,18 @@ class AO3StudioShell:
                 fandom_key=character.fandom_key,
                 character_id=character.id,
                 name=character.name,
-                color=str(result["avatar_color"]),
+                full_name=character.full_name or character.name,
+                color=character.color,
                 avatar_url=str(result["avatar_url"]),
                 tag_urls=character.tag_urls,
                 notes=character.notes or "",
             )
             self._notify("Character avatar uploaded.", "positive")
             dialog.close()
-            self.refresh()
+            if rerender:
+                rerender()
+            else:
+                self._render_right()
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Upload failed: {exc}", "negative")
 
@@ -3012,6 +3129,40 @@ class AO3StudioShell:
                 header_hit.on("click", lambda _=None: self._disarm_cluster_cleanup("evaluated"))
                 with header_hit:
                     self._render_cluster_cleanup_toolbar("evaluated", active.color)
+            elif self.page == "Read":
+                work_id = str(self.container.preferences_service.get("reader_work_id", "") or self.selected_work_id or "")
+                result = self.container.reader_service.open_work(work_id, auto_download=False) if work_id else None
+                if result and result.work:
+                    work = result.work
+                    chapters = result.chapters
+                    chapter_index = max(1, int(result.active_chapter_index or 1))
+                    chapter = chapters[chapter_index - 1] if chapters and chapter_index <= len(chapters) else None
+                    characters = self.container.fandom_service.list_characters(active.fandom_key)
+                    selected_id = self._reader_selected_character_id(
+                        work.work_id,
+                        chapter_index,
+                        characters,
+                        getattr(chapter, "html", "") if chapter else "",
+                    )
+                    selected_character = next((character for character in characters if character.id == selected_id), None)
+                    sticky_enabled = self._reader_pov_sticky_enabled(work.work_id)
+                    sticky_color = selected_character.color if selected_character and sticky_enabled else active.color
+                    with ui.row().classes("right-panel-header-hit w-full h-full items-center justify-between gap-1"):
+                        sticky = ui.button(icon="link" if sticky_enabled else "link_off").props("round flat dense size=sm")
+                        sticky.classes("reader-pov-header-icon")
+                        sticky.style(f"color: {normalized_label_color(sticky_color) if sticky_enabled else '#64748b'} !important;")
+                        sticky.on(
+                            "click.stop",
+                            lambda _=None, w=work.work_id, ch=chapter_index, enabled=sticky_enabled: self._set_reader_pov_sticky(w, ch, not enabled),
+                        )
+                        with sticky:
+                            rich_tooltip("POV persists between chapters" if sticky_enabled else "POV does not persist between chapters", sticky_color)
+                        reset = ui.button(icon="restart_alt").props("round flat dense size=sm")
+                        reset.classes("reader-pov-header-icon")
+                        reset.style(f"color: {normalized_label_color(active.color)} !important;")
+                        reset.on("click.stop", lambda _=None, w=work.work_id, ch=chapter_index: self._reset_reader_character_pool(w, ch))
+                        with reset:
+                            rich_tooltip("Reset character pool for this chapter", active.color)
 
     def _render_right(self) -> None:
         if not self.right_container:
@@ -3115,6 +3266,7 @@ class AO3StudioShell:
         work = result.work
         chapters = result.chapters
         chapter_index = max(1, int(result.active_chapter_index or 1))
+        chapter = chapters[chapter_index - 1] if chapters and chapter_index <= len(chapters) else None
         accent = normalized_label_color(active.color)
         refresh_color = {"current": "#7ee787", "outdated": "#ef4444", "missing": "#94a3b8"}.get(result.freshness, "#94a3b8")
         with ui.element("div").classes("soft-panel w-full p-2 right-panel-search").style("width: 100%; max-width: none; align-self: stretch;"):
@@ -3145,49 +3297,208 @@ class AO3StudioShell:
                 refresh.on("click.stop", lambda _=None, w=work.work_id: self._start_reader_download(w, force=True))
                 with refresh:
                     rich_tooltip("Refresh downloaded reader HTML", refresh_color)
-        self._render_reader_character_pills(active)
+        self._render_reader_character_pills(active, work, chapter, chapter_index)
 
-    def _render_reader_character_pills(self, active: FandomProfile) -> None:
+    def _render_reader_character_pills(self, active: FandomProfile, work: Work, chapter: Any | None, chapter_index: int) -> None:
         characters = self.container.fandom_service.list_characters(active.fandom_key)
         if not characters:
             return
-        selected_id = self._reader_selected_character_id(active.fandom_key, characters)
-        with ui.element("div").classes("soft-panel w-full p-2"):
-            with ui.row().classes("w-full gap-1 flex-wrap items-center reader-character-pill-row"):
-                for character in characters:
-                    selected = character.id == selected_id
-                    pill = ui.element("button").props("type=button").classes(
-                        "work-tag-pill browse-tag-pill reader-character-pill text-[11px]"
-                    )
-                    pill.style(self._filter_pill_style(character.color, selected))
-                    pill.on(
-                        "click",
-                        lambda _=None, c=character: self._set_reader_character_selection(c.id),
-                        js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
-                    )
-                    with pill:
-                        self._avatar_image(character.avatar_url, character.name, character.color, "22px", "200px", expand_side="left")
-                        ui.label(character.name).classes("browse-tag-pill-label reader-character-pill-label")
-                        rich_tooltip("Selected POV tint" if selected else "Select POV tint", character.color)
+        work_tags = self.container.work_library_service.tags_for_work(work.work_id)
+        chapter_html = getattr(chapter, "html", "") if chapter else ""
+        selected_id = self._reader_selected_character_id(work.work_id, chapter_index, characters, chapter_html)
+        committed = self._reader_character_view_committed(work.work_id, chapter_index)
+        visible_characters = _reader_visible_characters_for_chapter(
+            characters,
+            work_tags,
+            chapter_html,
+            committed=committed,
+        )
+        if selected_id and selected_id not in {character.id for character in visible_characters}:
+            selected_character = next((character for character in characters if character.id == selected_id), None)
+            if selected_character:
+                visible_characters.append(selected_character)
+        with ui.row().classes("w-full gap-x-1 gap-y-1.5 flex-wrap items-center reader-character-pill-row px-2 -mt-1"):
+            none_selected = self._reader_no_pov_enabled(work.work_id)
+            no_pov = ui.element("button").props("type=button").classes(
+                "work-tag-pill browse-tag-pill reader-character-pill reader-no-pov text-[11px]"
+            )
+            no_pov.style(self._filter_pill_style("#94a3b8", none_selected))
+            no_pov.on(
+                "click",
+                lambda _=None, w=work.work_id, c=chapter_index: self._set_reader_character_selection("", w, c),
+                js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
+            )
+            with no_pov:
+                ui.label("No POV").classes("browse-tag-pill-label reader-character-pill-label")
+                rich_tooltip("No POV tint", active.color)
+            for character in visible_characters:
+                display_name, _ = _character_profile_display_names(character)
+                selected = character.id == selected_id
+                pill = ui.element("button").props("type=button").classes(
+                    "work-tag-pill browse-tag-pill reader-character-pill text-[11px]"
+                )
+                pill.style(self._filter_pill_style(character.color, selected))
+                pill.on(
+                    "click",
+                    lambda _=None, c=character, w=work.work_id, ch=chapter_index: self._set_reader_character_selection(c.id, w, ch),
+                    js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
+                )
+                with pill:
+                    self._avatar_image(character.avatar_url, display_name, character.color, "22px", "200px", expand_side="left")
+                    ui.label(display_name).classes("browse-tag-pill-label reader-character-pill-label")
+                    rich_tooltip("Selected POV tint" if selected else "Select POV tint", character.color)
 
-    def _reader_selected_character_id(self, fandom_key_value: str, characters: list[CharacterProfile] | None = None) -> str:
-        key = f"reader_selected_character:{fandom_key_value}"
+    @staticmethod
+    def _reader_selected_character_key(work_id: str, chapter_index: int) -> str:
+        return f"reader_selected_character:{work_id}:{max(1, int(chapter_index or 1))}"
+
+    @staticmethod
+    def _reader_pov_sticky_key(work_id: str) -> str:
+        return f"reader_pov_sticky:{work_id}"
+
+    @staticmethod
+    def _reader_sticky_character_key(work_id: str) -> str:
+        return f"reader_sticky_character:{work_id}"
+
+    @staticmethod
+    def _reader_pov_timeline_key(work_id: str) -> str:
+        return f"reader_pov_timeline:{work_id}"
+
+    @staticmethod
+    def _reader_no_pov_key(work_id: str) -> str:
+        return f"reader_no_pov:{work_id}"
+
+    @staticmethod
+    def _reader_character_pool_reset_key(work_id: str, chapter_index: int) -> str:
+        return f"reader_character_pool_reset:{work_id}:{max(1, int(chapter_index or 1))}"
+
+    def _reader_pov_sticky_enabled(self, work_id: str) -> bool:
+        return bool(self.container.preferences_service.get(self._reader_pov_sticky_key(work_id), False))
+
+    def _reader_character_pool_reset(self, work_id: str, chapter_index: int) -> bool:
+        return bool(self.container.preferences_service.get(self._reader_character_pool_reset_key(work_id, chapter_index), False))
+
+    def _reader_no_pov_enabled(self, work_id: str) -> bool:
+        return bool(self.container.preferences_service.get(self._reader_no_pov_key(work_id), False))
+
+    def _reader_character_view_committed(self, work_id: str, chapter_index: int) -> bool:
+        if self._reader_character_list_committed(work_id, chapter_index):
+            return True
+        return self._reader_pov_sticky_enabled(work_id) and not self._reader_character_pool_reset(work_id, chapter_index)
+
+    def _reader_pov_timeline(self, work_id: str) -> dict[int, str]:
+        raw = self.container.preferences_service.get(self._reader_pov_timeline_key(work_id), {})
+        if not isinstance(raw, dict):
+            return {}
+        timeline: dict[int, str] = {}
+        for chapter, character_id in raw.items():
+            try:
+                chapter_index = max(1, int(chapter))
+            except (TypeError, ValueError):
+                continue
+            value = str(character_id or "").strip()
+            if value:
+                timeline[chapter_index] = value
+        return timeline
+
+    def _save_reader_pov_timeline(self, work_id: str, timeline: dict[int, str]) -> None:
+        payload = {str(chapter): character_id for chapter, character_id in sorted(timeline.items()) if character_id}
+        self.container.preferences_service.set(self._reader_pov_timeline_key(work_id), payload)
+
+    def _reader_timeline_character_id(self, work_id: str, chapter_index: int) -> str:
+        timeline = self._reader_pov_timeline(work_id)
+        previous_chapters = [chapter for chapter in timeline if chapter <= max(1, int(chapter_index or 1))]
+        if previous_chapters:
+            return timeline[max(previous_chapters)]
+        legacy_id = str(self.container.preferences_service.get(self._reader_sticky_character_key(work_id), "") or "")
+        return legacy_id
+
+    def _reader_selected_character_id(
+        self,
+        work_id: str,
+        chapter_index: int,
+        characters: list[CharacterProfile] | None = None,
+        chapter_html: str = "",
+    ) -> str:
+        if self._reader_no_pov_enabled(work_id):
+            return ""
+        key = self._reader_selected_character_key(work_id, chapter_index)
         selected_id = str(self.container.preferences_service.get(key, "") or "")
-        if selected_id and characters is not None and selected_id not in {character.id for character in characters}:
+        character_by_id = {character.id: character for character in characters or []}
+        if selected_id and characters is not None and selected_id not in character_by_id:
             self.container.preferences_service.set(key, "")
             return ""
-        return selected_id
+        if selected_id:
+            return selected_id
+        if not self._reader_pov_sticky_enabled(work_id):
+            return ""
+        sticky_key = self._reader_sticky_character_key(work_id)
+        sticky_id = self._reader_timeline_character_id(work_id, chapter_index)
+        if not sticky_id:
+            return ""
+        if characters is not None and sticky_id not in character_by_id:
+            return ""
+        sticky_character = character_by_id.get(sticky_id)
+        if sticky_character and not _chapter_mentions_character(chapter_html, sticky_character):
+            return ""
+        if not sticky_character and characters is not None:
+            return ""
+        return sticky_id
 
-    def _reader_selected_character(self, fandom_key_value: str, characters: list[CharacterProfile]) -> CharacterProfile | None:
-        selected_id = self._reader_selected_character_id(fandom_key_value, characters)
+    def _reader_selected_character(
+        self,
+        work_id: str,
+        chapter_index: int,
+        characters: list[CharacterProfile],
+        chapter_html: str = "",
+    ) -> CharacterProfile | None:
+        selected_id = self._reader_selected_character_id(work_id, chapter_index, characters, chapter_html)
         return next((character for character in characters if character.id == selected_id), None)
 
-    def _set_reader_character_selection(self, character_id: str) -> None:
-        active = self._active_fandom()
-        key = f"reader_selected_character:{active.fandom_key}"
-        current = str(self.container.preferences_service.get(key, "") or "")
-        self.container.preferences_service.set(key, "" if current == character_id else character_id)
+    def _set_reader_pov_sticky(self, work_id: str, chapter_index: int, enabled: bool) -> None:
+        self.container.preferences_service.set(self._reader_pov_sticky_key(work_id), bool(enabled))
+        if enabled:
+            current_id = str(self.container.preferences_service.get(self._reader_selected_character_key(work_id, chapter_index), "") or "")
+            if current_id:
+                timeline = self._reader_pov_timeline(work_id)
+                timeline[max(1, int(chapter_index or 1))] = current_id
+                self._save_reader_pov_timeline(work_id, timeline)
+                self.container.preferences_service.set(self._reader_sticky_character_key(work_id), current_id)
+            self.container.preferences_service.set(self._reader_character_pool_reset_key(work_id, chapter_index), False)
         self._render_center()
+        self._render_right_header()
+        self._render_right()
+
+    def _reset_reader_character_pool(self, work_id: str, chapter_index: int) -> None:
+        self.container.preferences_service.set(self._reader_character_commit_key(work_id, chapter_index), False)
+        self.container.preferences_service.set(self._reader_character_pool_reset_key(work_id, chapter_index), True)
+        self._render_right_header()
+        self._render_right()
+
+    def _reader_character_commit_key(self, work_id: str, chapter_index: int) -> str:
+        return f"reader_character_committed:{work_id}:{max(1, int(chapter_index or 1))}"
+
+    def _reader_character_list_committed(self, work_id: str, chapter_index: int) -> bool:
+        return bool(self.container.preferences_service.get(self._reader_character_commit_key(work_id, chapter_index), False))
+
+    def _set_reader_character_selection(self, character_id: str, work_id: str = "", chapter_index: int = 1) -> None:
+        key = self._reader_selected_character_key(work_id, chapter_index)
+        no_pov_key = self._reader_no_pov_key(work_id)
+        if not character_id:
+            self.container.preferences_service.set(no_pov_key, not self._reader_no_pov_enabled(work_id))
+        else:
+            self.container.preferences_service.set(no_pov_key, False)
+            self.container.preferences_service.set(key, str(character_id))
+        if work_id:
+            self.container.preferences_service.set(self._reader_character_commit_key(work_id, chapter_index), True)
+            self.container.preferences_service.set(self._reader_character_pool_reset_key(work_id, chapter_index), False)
+            if character_id and self._reader_pov_sticky_enabled(work_id):
+                timeline = self._reader_pov_timeline(work_id)
+                timeline[max(1, int(chapter_index or 1))] = str(character_id)
+                self._save_reader_pov_timeline(work_id, timeline)
+                self.container.preferences_service.set(self._reader_sticky_character_key(work_id), str(character_id))
+        self._render_center()
+        self._render_right_header()
         self._render_right()
 
     def _render_batch_side_panel(self, mode: str) -> None:
@@ -5200,10 +5511,17 @@ class AO3StudioShell:
                         with ui.scroll_area().classes("reader-panel-scroll w-full h-full flex-grow"):
                             if chapter:
                                 characters = self.container.fandom_service.list_characters(active.fandom_key)
-                                selected_character = self._reader_selected_character(active.fandom_key, characters)
+                                selected_character = self._reader_selected_character(
+                                    work.work_id,
+                                    chapter_index,
+                                    characters,
+                                    chapter.html,
+                                )
                                 rendered = _reader_highlight_characters(chapter.html, characters)
-                                if selected_character:
-                                    rendered = _reader_apply_pov_paragraph_colors(rendered, selected_character.color)
+                                rendered = _reader_apply_pov_paragraph_colors(
+                                    rendered,
+                                    selected_character.color if selected_character else None,
+                                )
                                 prose_style = html.escape(self._reader_font_style(style_settings), quote=True)
                                 ui.html(
                                     f'<div class="reader-html-root"><div class="reader-prose" style="{prose_style}">{rendered}</div></div>',
@@ -8316,17 +8634,203 @@ def _score_summary(scores: dict[str, Any]) -> str:
     return " | ".join(f"{key}: {value}" for key, value in scores.items())
 
 
+def _canonical_ao3_character_tag_url(value: str | None) -> str:
+    label = _ao3_character_tag_label(value)
+    if not label:
+        return ""
+    return f"https://archiveofourown.org/tags/{quote(label, safe='')}/works"
+
+
+def _ao3_character_tag_label(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    path = parsed.path if parsed.scheme or parsed.netloc else raw
+    match = re.search(r"/tags/([^/]+)(?:/works)?/?$", path)
+    if match:
+        return " ".join(unquote(match.group(1)).split())
+    return " ".join(unquote(raw).split())
+
+
+def _character_names_from_ao3_label(value: str | None) -> tuple[str, str]:
+    label = _ao3_character_tag_label(value)
+    label = re.sub(r"\s*\([^)]*\)\s*$", "", label).strip()
+    label = " ".join(label.split())
+    if not label:
+        return "", ""
+    nickname_match = re.search(r"[\"\u201c\u201d]([^\"\u201c\u201d]+)[\"\u201c\u201d]", label)
+    full_name = re.sub(r"\s*[\"\u201c\u201d][^\"\u201c\u201d]+[\"\u201c\u201d]\s*", " ", label).strip()
+    full_name = " ".join(full_name.split()) or label
+    if nickname_match:
+        short_name = " ".join(nickname_match.group(1).split())
+    else:
+        short_name = re.split(r"\s+", full_name, maxsplit=1)[0].strip()
+    return short_name, full_name
+
+
+def _character_profile_display_names(character: Any) -> tuple[str, str]:
+    stored_name = str(getattr(character, "name", "") or "").strip()
+    stored_full_name = str(getattr(character, "full_name", "") or "").strip()
+    tag_urls = list(getattr(character, "tag_urls", []) or [])
+    source_label = (tag_urls[0] if tag_urls else "") or stored_full_name or stored_name
+    derived_name, derived_full_name = _character_names_from_ao3_label(source_label)
+    display_full_name = stored_full_name or stored_name
+    display_name = stored_name or derived_name
+    if derived_full_name and (not display_full_name or display_full_name == stored_name):
+        display_full_name = derived_full_name
+    if derived_name and (
+        not display_name
+        or display_name == display_full_name
+        or len(display_name.split()) > 1
+        or "\"" in display_name
+        or "\u201c" in display_name
+        or "\u201d" in display_name
+    ):
+        display_name = derived_name
+    return display_name or display_full_name, display_full_name or display_name
+
+
+def _canonical_character_suggestions(suggestions: list[Any], query: str = "") -> list[Any]:
+    candidates: list[tuple[Any, str, str, bool, int]] = []
+    query_key = _character_match_key(query)
+    for index, suggestion in enumerate(suggestions):
+        raw_label = _ao3_character_tag_label(
+            str(getattr(suggestion, "tag_url", "") or getattr(suggestion, "tag_text", ""))
+        )
+        if not raw_label or re.search(r"\([^)]*\)\s*$", raw_label):
+            continue
+        short_name, full_name = _character_names_from_ao3_label(raw_label)
+        if len(short_name) < 2 or len(full_name) < 2:
+            continue
+        has_quoted_name = bool(re.search(r"[\"\u201c\u201d][^\"\u201c\u201d]+[\"\u201c\u201d]", raw_label))
+        candidates.append((suggestion, short_name, full_name, has_quoted_name, index))
+
+    quoted_short_names = {short.casefold() for _, short, _, has_quoted, _ in candidates if has_quoted}
+    filtered = [
+        candidate
+        for candidate in candidates
+        if candidate[3] or candidate[1].casefold() not in quoted_short_names
+    ]
+
+    def rank(candidate: tuple[Any, str, str, bool, int]) -> tuple[int, int, int, int]:
+        suggestion, short_name, full_name, has_quoted_name, index = candidate
+        label = _ao3_character_tag_label(str(getattr(suggestion, "tag_text", "") or ""))
+        haystack = f"{short_name} {full_name} {label}".casefold()
+        starts_query = int(bool(query_key) and (short_name.casefold().startswith(query_key) or full_name.casefold().startswith(query_key)))
+        contains_query = int(bool(query_key) and query_key in haystack)
+        return (-starts_query, -contains_query, -int(has_quoted_name), index)
+
+    return [candidate[0] for candidate in sorted(filtered, key=rank)]
+
+
+def _character_label_variants(value: str | None) -> set[str]:
+    label = _ao3_character_tag_label(value)
+    if not label:
+        return set()
+    variants = {label}
+    stripped = re.sub(r"\s*\([^)]*\)\s*$", "", label).strip()
+    if stripped:
+        variants.add(stripped)
+    return variants
+
+
+def _character_match_key(value: str | None) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _character_aliases(character: Any) -> set[str]:
+    labels: set[str] = set()
+    labels.update(_character_label_variants(getattr(character, "name", "")))
+    labels.update(_character_label_variants(getattr(character, "full_name", "")))
+    for tag_url in getattr(character, "tag_urls", []) or []:
+        labels.update(_character_label_variants(tag_url))
+    aliases: set[str] = set()
+    for label in labels:
+        clean = " ".join(str(label or "").split())
+        if len(clean) >= 3:
+            aliases.add(clean)
+        first = re.split(r"\s+", clean, maxsplit=1)[0].strip()
+        if len(first) >= 3:
+            aliases.add(first)
+        for nickname in re.findall(r"[\"“”]([^\"“”]+)[\"“”]", clean):
+            nickname = " ".join(nickname.split())
+            if len(nickname) >= 3:
+                aliases.add(nickname)
+    return aliases
+
+
+def _character_work_tag_keys(tag: WorkTag) -> set[str]:
+    if tag.tag_type is not TagType.CHARACTER:
+        return set()
+    keys: set[str] = set()
+    canonical_url = _canonical_ao3_character_tag_url(tag.tag_url or tag.tag_text)
+    if canonical_url:
+        keys.add(f"url:{canonical_url.casefold()}")
+    for label in _character_label_variants(tag.tag_text):
+        key = _character_match_key(label)
+        if key:
+            keys.add(f"label:{key}")
+    for label in _character_label_variants(tag.tag_url):
+        key = _character_match_key(label)
+        if key:
+            keys.add(f"label:{key}")
+    return keys
+
+
+def _character_profile_match_keys(character: Any) -> set[str]:
+    keys: set[str] = set()
+    for tag_url in getattr(character, "tag_urls", []) or []:
+        canonical_url = _canonical_ao3_character_tag_url(tag_url)
+        if canonical_url:
+            keys.add(f"url:{canonical_url.casefold()}")
+    for alias in _character_aliases(character):
+        key = _character_match_key(alias)
+        if key:
+            keys.add(f"label:{key}")
+    return keys
+
+
+def _character_matches_work_tags(character: Any, work_tags: list[WorkTag]) -> bool:
+    character_keys = _character_profile_match_keys(character)
+    if not character_keys:
+        return False
+    for tag in work_tags:
+        if character_keys.intersection(_character_work_tag_keys(tag)):
+            return True
+    return False
+
+
+def _chapter_mentions_character(chapter_html: str, character: Any) -> bool:
+    text = BeautifulSoup(chapter_html or "", "lxml").get_text(" ", strip=True)
+    if not text:
+        return False
+    for alias in sorted(_character_aliases(character), key=len, reverse=True):
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(alias)}(?:['\u2019]s)?(?![A-Za-z0-9_])", text, re.IGNORECASE):
+            return True
+    return False
+
+
+def _reader_visible_characters_for_chapter(
+    characters: list[CharacterProfile],
+    work_tags: list[WorkTag],
+    chapter_html: str,
+    *,
+    committed: bool,
+) -> list[CharacterProfile]:
+    work_tagged_ids = {character.id for character in characters if _character_matches_work_tags(character, work_tags)}
+    mentioned_ids = {character.id for character in characters if _chapter_mentions_character(chapter_html, character)}
+    visible_ids = mentioned_ids if committed else work_tagged_ids | mentioned_ids
+    return [character for character in characters if character.id in visible_ids]
+
+
 def _reader_highlight_characters(fragment: str, characters: list[Any]) -> str:
     names: dict[str, str] = {}
     for character in characters:
-        full = str(getattr(character, "name", "") or "").strip()
         color = str(getattr(character, "color", "") or "#58a6ff")
-        if not full:
-            continue
-        names[full] = color
-        first = re.split(r"\s+", full, maxsplit=1)[0].strip()
-        if len(first) >= 3:
-            names.setdefault(first, color)
+        for alias in _character_aliases(character):
+            if len(alias) >= 3:
+                names.setdefault(alias, color)
     if not names:
         return fragment
     pattern = re.compile(
@@ -8352,7 +8856,7 @@ def _reader_highlight_characters(fragment: str, characters: list[Any]) -> str:
             parts.append(f'<span style="{html.escape(style, quote=True)}">{html.escape(matched)}</span>')
             last = match.end()
         parts.append(html.escape(text[last:]))
-        replacement = BeautifulSoup("".join(parts), "lxml")
+        replacement = BeautifulSoup("".join(parts), "html.parser")
         node.replace_with(*list((replacement.body or replacement).contents))
     body = soup.body or soup
     return str(body.decode_contents())

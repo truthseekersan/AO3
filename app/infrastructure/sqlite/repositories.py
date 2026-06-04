@@ -630,13 +630,14 @@ class SQLiteCharacterProfileRepository:
                 conn.execute(
                     """
                     INSERT INTO character_profiles(
-                        id, fandom_key, name, color, avatar_url, tag_urls_json, notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        id, fandom_key, name, full_name, color, avatar_url, tag_urls_json, notes, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         character.id,
                         character.fandom_key,
                         character.name,
+                        character.full_name or character.name,
                         character.color,
                         character.avatar_url,
                         _json_dumps(character.tag_urls),
@@ -651,6 +652,7 @@ class SQLiteCharacterProfileRepository:
                 UPDATE character_profiles
                 SET fandom_key = ?,
                     name = ?,
+                    full_name = ?,
                     color = ?,
                     avatar_url = ?,
                     tag_urls_json = ?,
@@ -661,6 +663,7 @@ class SQLiteCharacterProfileRepository:
                 (
                     character.fandom_key,
                     character.name,
+                    character.full_name or character.name,
                     character.color,
                     character.avatar_url,
                     _json_dumps(character.tag_urls),
@@ -688,6 +691,7 @@ class SQLiteCharacterProfileRepository:
             id=row["id"],
             fandom_key=row["fandom_key"],
             name=row["name"],
+            full_name=row["full_name"] if "full_name" in row.keys() else row["name"],
             color=row["color"],
             avatar_url=row["avatar_url"],
             tag_urls=list(_json_loads(row["tag_urls_json"], [])),
