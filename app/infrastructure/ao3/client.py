@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import quote
 
 import httpx
 
@@ -10,7 +11,10 @@ from app.infrastructure.ao3.parser import (
     AO3_BASE_URL,
     parse_browse_page,
     parse_fandom_tag_catalog,
+    parse_fandom_suggestions,
     parse_html_download_url,
+    parse_media_categories,
+    parse_media_fandoms,
     parse_reader_html,
     parse_work_page,
 )
@@ -96,6 +100,58 @@ class AO3Client:
         except Exception:
             response = self._get(normalized)
             return parse_fandom_tag_catalog(response.text, str(response.url), fandom_key)
+
+    def suggest_fandom_tags(self, query: str, limit: int = 12):
+        clean_query = " ".join(str(query or "").split())
+        if not clean_query:
+            return []
+        normalized = (
+            f"{AO3_BASE_URL}/tags/search?"
+            f"tag_search%5Bname%5D={quote(clean_query, safe='')}"
+            "&tag_search%5Btype%5D=Fandom"
+            "&tag_search%5Bcanonical%5D=T"
+        )
+        try:
+            html = self.browser_fetcher.fetch_html(normalized)
+            self._raise_if_shielded(html)
+            return parse_fandom_suggestions(html, normalized, limit)
+        except AO3AccessBlockedError:
+            raise
+        except BrowserFetchError as exc:
+            raise AO3AccessBlockedError(str(exc)) from exc
+        except Exception:
+            response = self._get(normalized)
+            return parse_fandom_suggestions(response.text, str(response.url), limit)
+
+    def fetch_media_categories(self):
+        normalized = f"{AO3_BASE_URL}/media"
+        try:
+            html = self.browser_fetcher.fetch_html(normalized, timeout=max(self.timeout, 15.0))
+            self._raise_if_shielded(html)
+            return parse_media_categories(html, normalized)
+        except AO3AccessBlockedError:
+            raise
+        except BrowserFetchError:
+            response = self._get(normalized)
+            return parse_media_categories(response.text, str(response.url))
+        except Exception:
+            response = self._get(normalized)
+            return parse_media_categories(response.text, str(response.url))
+
+    def fetch_media_fandoms(self, media_key: str, label: str, url: str, color: str):
+        normalized = self._normalize_url(url)
+        try:
+            html = self.browser_fetcher.fetch_html(normalized, timeout=max(self.timeout, 30.0))
+            self._raise_if_shielded(html)
+            return parse_media_fandoms(html, normalized, media_key, label, color)
+        except AO3AccessBlockedError:
+            raise
+        except BrowserFetchError:
+            response = self._get(normalized)
+            return parse_media_fandoms(response.text, str(response.url), media_key, label, color)
+        except Exception:
+            response = self._get(normalized)
+            return parse_media_fandoms(response.text, str(response.url), media_key, label, color)
 
     def open_account_session(self, url: str = AO3_BASE_URL) -> str:
         return self._normalize_url(url)

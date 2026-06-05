@@ -313,6 +313,14 @@ def apply_theme() -> None:
                 padding: 0 !important;
                 box-sizing: border-box !important;
             }
+            .left-fandom-scroll .q-scrollarea__content,
+            .left-fandom-scroll .q-scrollarea__content > div {
+                width: 100% !important;
+                min-width: 100% !important;
+                max-width: none !important;
+                padding: 0 !important;
+                box-sizing: border-box !important;
+            }
             .right-panel-column {
                 width: 100% !important;
                 min-width: 100% !important;
@@ -690,6 +698,9 @@ def apply_theme() -> None:
             .reader-panel-scroll {
                 background: #0d1117;
             }
+            .reader-panel-scroll.reader-scroll-restoring {
+                opacity: 0;
+            }
             .reader-html-root {
                 width: 100%;
                 min-height: 100%;
@@ -811,6 +822,17 @@ def apply_theme() -> None:
             }
             .character-profile-expanded {
                 margin-top: 2px;
+            }
+            .character-font-icon {
+                transition: color 0.14s ease, text-shadow 0.14s ease;
+            }
+            .character-font-icon:hover {
+                color: var(--character-font-color, #7ee787) !important;
+                text-shadow: 0 0 8px var(--character-font-color, #7ee787);
+            }
+            .schema-expanded-pill {
+                border-radius: 8px !important;
+                overflow: hidden;
             }
             .tag-type-label {
                 color: #64748b;
@@ -1123,9 +1145,15 @@ def apply_theme() -> None:
                 box-shadow: 0 0 14px rgba(239, 68, 68, 0.24);
             }
             .fandom-row {
+                align-self: stretch;
                 border: 1px solid transparent;
                 border-radius: 7px;
+                box-sizing: border-box;
+                flex-wrap: nowrap;
+                max-width: 100%;
+                min-width: 0;
                 transition: background 0.15s ease, border 0.15s ease, filter 0.15s ease;
+                width: 100%;
             }
             .fandom-row:hover {
                 background: rgba(48, 54, 61, 0.55);
@@ -1134,6 +1162,13 @@ def apply_theme() -> None:
             .fandom-row-selected {
                 background: linear-gradient(135deg, rgba(var(--accent-r), var(--accent-g), var(--accent-b), 0.22), rgba(var(--accent-r), var(--accent-g), var(--accent-b), 0.07));
                 border-left: 2px solid rgba(var(--accent-r), var(--accent-g), var(--accent-b), 0.72);
+            }
+            .fandom-row.cleanup-select-row {
+                border-color: rgba(107, 114, 128, 0.24);
+            }
+            .fandom-row.cleanup-row-selected {
+                border-color: rgba(239, 68, 68, 0.82) !important;
+                box-shadow: 0 0 14px rgba(239, 68, 68, 0.20);
             }
             .fandom-avatar {
                 width: 34px;

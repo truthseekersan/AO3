@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import re
-from urllib.parse import parse_qs, unquote, unquote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, unquote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
 
 from app.application.services import normalize_author_key, utc_now_iso
-from app.domain.entities import FandomTagCatalogItem, ReaderChapter, Work, WorkTag
+from app.domain.entities import FandomDirectorySource, FandomSuggestion, FandomTagCatalogItem, ReaderChapter, Work, WorkTag
 from app.domain.enums import TagType
 from app.infrastructure.ao3.models import (
     AO3FilterGroup,
@@ -493,6 +493,98 @@ def parse_fandom_tag_catalog(html: str, source_url: str, fandom_key: str) -> lis
             fetched_at=fetched_at,
         )
     return list(items.values())
+
+
+def parse_fandom_suggestions(html: str, source_url: str, limit: int = 12) -> list[FandomSuggestion]:
+    soup = BeautifulSoup(html, "lxml")
+    suggestions: dict[str, FandomSuggestion] = {}
+    for link in soup.select("a[href*='/tags/']"):
+        if not isinstance(link, Tag):
+            continue
+        href = str(link.get("href") or "")
+        if "/works" in href and "/tags/" not in href:
+            continue
+        tag = _tag_from_tag_url(href)
+        if not tag:
+            continue
+        row_text = _text(link.find_parent(["li", "tr", "dd", "dt"]) or link)
+        if row_text and "fandom" not in row_text.casefold():
+            continue
+        label = _text(link) or tag
+        if label.casefold() in {"works", "bookmarks"}:
+            label = tag
+        url = urljoin(AO3_BASE_URL, f"/tags/{quote_for_tag(tag)}/works")
+        suggestions.setdefault(tag.casefold(), FandomSuggestion(tag=tag, label=label, url=url))
+        if len(suggestions) >= limit:
+            break
+    return list(suggestions.values())
+
+
+def parse_media_categories(html: str, source_url: str) -> list[FandomDirectorySource]:
+    soup = BeautifulSoup(html, "lxml")
+    sources: dict[str, FandomDirectorySource] = {}
+    for link in soup.select("a[href*='/media/'][href$='/fandoms'], a[href*='/media/'][href*='/fandoms']"):
+        if not isinstance(link, Tag):
+            continue
+        href = str(link.get("href") or "")
+        parsed = urlparse(urljoin(AO3_BASE_URL, href))
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) < 3 or parts[0] != "media" or parts[-1] != "fandoms":
+            continue
+        media_key = " ".join(unquote(parts[1]).split())
+        label = _text(link) or media_key.replace(" *a* ", " & ")
+        sources.setdefault(
+            media_key.casefold(),
+            FandomDirectorySource(
+                media_key=media_key,
+                label=label,
+                url=urljoin(AO3_BASE_URL, parsed.path),
+                color="#58a6ff",
+            ),
+        )
+    return list(sources.values())
+
+
+def parse_media_fandoms(html: str, source_url: str, media_key: str, media_label: str, color: str, limit: int = 0) -> list[FandomSuggestion]:
+    soup = BeautifulSoup(html, "lxml")
+    suggestions: dict[str, FandomSuggestion] = {}
+    for link in soup.select("a[href*='/tags/']"):
+        if not isinstance(link, Tag):
+            continue
+        href = str(link.get("href") or "")
+        tag = _tag_from_tag_url(href)
+        if not tag:
+            continue
+        label = _text(link) or tag
+        if tag.casefold() == "search" or label.casefold() in {"works", "bookmarks", "tags"}:
+            continue
+        suggestions.setdefault(
+            tag.casefold(),
+            FandomSuggestion(
+                tag=tag,
+                label=label,
+                url=urljoin(AO3_BASE_URL, f"/tags/{quote_for_tag(tag)}/works"),
+                media_key=media_key,
+                media_label=media_label,
+                color=color,
+            ),
+        )
+        if limit and len(suggestions) >= limit:
+            break
+    return list(suggestions.values())
+
+
+def _tag_from_tag_url(href: str) -> str:
+    parsed = urlparse(urljoin(AO3_BASE_URL, href))
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 2 and parts[0] == "tags":
+        return " ".join(unquote(parts[1]).split())
+    tag_id = (parse_qs(parsed.query).get("tag_id") or [""])[0]
+    return " ".join(unquote_plus(tag_id).split()) if tag_id else ""
+
+
+def quote_for_tag(tag: str) -> str:
+    return quote(tag, safe="")
 
 
 def _reader_chapter_nodes(soup: BeautifulSoup) -> list[Tag]:

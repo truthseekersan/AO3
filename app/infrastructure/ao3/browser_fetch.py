@@ -41,7 +41,7 @@ class BrowserAssistedFetcher:
     def __init__(self, timeout: float = 2.0) -> None:
         self.timeout = timeout
 
-    def fetch_html(self, url: str) -> str:
+    def fetch_html(self, url: str, timeout: float | None = None) -> str:
         if curl_requests is None:
             raise BrowserFetchError("curl_cffi is not installed in this Python environment.")
         snapshot = self._best_firefox_cookie_snapshot()
@@ -57,7 +57,7 @@ class BrowserAssistedFetcher:
                     impersonate="firefox",
                     cookies=snapshot.cookies,
                     headers=self._firefox_headers(),
-                    timeout=self.timeout,
+                    timeout=timeout or self.timeout,
                     allow_redirects=True,
                 )
             except Exception as exc:  # noqa: BLE001

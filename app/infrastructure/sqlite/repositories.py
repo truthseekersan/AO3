@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
 import platform
+import sqlite3
+import tempfile
 import uuid
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
+from zipfile import ZIP_STORED, ZipFile
 
 from app.application.services import normalize_author_key, utc_now_iso
 from app.domain.entities import (
@@ -17,7 +22,9 @@ from app.domain.entities import (
     EvaluationBatch,
     EvaluationQueueItem,
     EvaluationSchema,
+    FandomDirectorySource,
     FandomProfile,
+    FandomSuggestion,
     FandomStyleOverride,
     FandomTagCatalogItem,
     FavoriteTag,
@@ -51,6 +58,7 @@ from app.domain.enums import (
     TagType,
 )
 from app.infrastructure.sqlite.database import SQLiteDatabase
+from app.infrastructure.config.paths import CHARACTER_AVATAR_DIR, FANDOM_AVATAR_DIR
 
 
 def _json_dumps(value: Any) -> str:
@@ -318,6 +326,53 @@ class SQLiteWorkRepository:
     def count(self) -> int:
         with self.db.connect() as conn:
             return int(conn.execute("SELECT COUNT(*) FROM works").fetchone()[0])
+
+    def count_for_fandom(self, fandom_key: str, fandom_tag: str) -> int:
+        with self.db.connect() as conn:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT works.work_id)
+                    FROM works
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM work_tags
+                        WHERE work_tags.work_id = works.work_id
+                          AND work_tags.tag_type = ?
+                          AND work_tags.tag_text = ?
+                    )
+                       OR EXISTS (
+                        SELECT 1
+                        FROM work_collection
+                        WHERE work_collection.work_id = works.work_id
+                          AND work_collection.fandom_key = ?
+                    )
+                       OR EXISTS (
+                        SELECT 1
+                        FROM work_set_items
+                        JOIN work_sets ON work_sets.id = work_set_items.set_id
+                        WHERE work_set_items.work_id = works.work_id
+                          AND work_sets.fandom_key = ?
+                    )
+                       OR EXISTS (
+                        SELECT 1
+                        FROM evaluation_queue
+                        JOIN evaluation_batches ON evaluation_batches.id = evaluation_queue.batch_id
+                        WHERE evaluation_queue.work_id = works.work_id
+                          AND evaluation_batches.fandom_key = ?
+                    )
+                       OR EXISTS (
+                        SELECT 1
+                        FROM evaluation_batches
+                        JOIN work_sets ON work_sets.id = evaluation_batches.work_set_id
+                        JOIN work_set_items ON work_set_items.set_id = work_sets.id
+                        WHERE work_set_items.work_id = works.work_id
+                          AND evaluation_batches.fandom_key = ?
+                    )
+                    """,
+                    (TagType.FANDOM.value, fandom_tag, fandom_key, fandom_key, fandom_key, fandom_key),
+                ).fetchone()[0]
+            )
 
     def delete_uncollected_cache(self, keep_work_ids: list[str] | None = None) -> int:
         keep = [str(work_id) for work_id in (keep_work_ids or []) if str(work_id).strip()]
@@ -592,6 +647,449 @@ class SQLiteFandomRepository:
         with self.db.connect() as conn:
             conn.execute("UPDATE fandom_profiles SET selected_at = ? WHERE fandom_key = ?", (utc_now_iso(), fandom_key))
 
+    def delete(self, fandom_key: str) -> None:
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM fandom_profiles WHERE fandom_key = ?", (fandom_key,))
+
+    def export_backup_zip(self, fandom_key: str) -> tuple[str, bytes]:
+        with tempfile.TemporaryDirectory(prefix="ao3_fandom_backup_") as temp_dir:
+            temp_path = Path(temp_dir)
+            backup_db_path = temp_path / "fandom.sqlite"
+            SQLiteDatabase(backup_db_path)
+            source = self.db.connect()
+            dest = sqlite3.connect(backup_db_path)
+            try:
+                source.row_factory = sqlite3.Row
+                dest.row_factory = sqlite3.Row
+                dest.execute("PRAGMA foreign_keys = OFF")
+                profile = source.execute("SELECT * FROM fandom_profiles WHERE fandom_key = ?", (fandom_key,)).fetchone()
+                if not profile:
+                    raise ValueError("Fandom profile not found.")
+                work_ids, schema_keys, local_user_ids = self._export_fandom_rows(source, dest, fandom_key, str(profile["tag"]))
+                file_map = self._fandom_file_map(source, fandom_key)
+                manifest = {
+                    "format": "ao3-studio-fandom-backup",
+                    "version": 1,
+                    "created_at": utc_now_iso(),
+                    "fandom_key": fandom_key,
+                    "tag": profile["tag"],
+                    "display_name": profile["display_name"],
+                    "work_count": len(work_ids),
+                    "schema_keys": sorted(schema_keys),
+                    "local_user_ids": sorted(local_user_ids),
+                    "files": sorted(file_map.keys()),
+                }
+                dest.commit()
+            finally:
+                dest.close()
+                source.close()
+            buffer = io.BytesIO()
+            with ZipFile(buffer, "w", compression=ZIP_STORED) as archive:
+                archive.write(backup_db_path, "fandom.sqlite")
+                archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
+                for archive_name, file_path in file_map.items():
+                    if file_path.exists() and file_path.is_file():
+                        archive.write(file_path, f"files/{archive_name}")
+            safe_name = "".join(ch for ch in str(profile["display_name"]) if ch.isalnum() or ch in {" ", "-", "_"}).strip() or fandom_key
+            return f"{safe_name}.ao3fandom.zip", buffer.getvalue()
+
+    def import_backup_zip(self, payload: bytes) -> FandomProfile:
+        with tempfile.TemporaryDirectory(prefix="ao3_fandom_import_") as temp_dir:
+            temp_path = Path(temp_dir)
+            with ZipFile(io.BytesIO(payload), "r") as archive:
+                names = set(archive.namelist())
+                if "manifest.json" not in names or "fandom.sqlite" not in names:
+                    raise ValueError("This is not an AO3 Studio fandom backup zip.")
+                manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+                if manifest.get("format") != "ao3-studio-fandom-backup":
+                    raise ValueError("Unsupported fandom backup format.")
+                backup_db_path = temp_path / "fandom.sqlite"
+                backup_db_path.write_bytes(archive.read("fandom.sqlite"))
+                for name in names:
+                    if not name.startswith("files/") or name.endswith("/"):
+                        continue
+                    relative = Path(name[len("files/") :])
+                    if relative.is_absolute() or ".." in relative.parts or len(relative.parts) < 2:
+                        continue
+                    target_base = FANDOM_AVATAR_DIR if relative.parts[0] == "fandom_avatars" else CHARACTER_AVATAR_DIR if relative.parts[0] == "character_avatars" else None
+                    if target_base is None:
+                        continue
+                    target_base.mkdir(parents=True, exist_ok=True)
+                    target = target_base / relative.name
+                    target.write_bytes(archive.read(name))
+            source = sqlite3.connect(backup_db_path)
+            dest = self.db.connect()
+            try:
+                source.row_factory = sqlite3.Row
+                self._import_fandom_rows(source, dest)
+                dest.commit()
+            finally:
+                source.close()
+                dest.close()
+            imported_key = str(manifest.get("fandom_key") or "")
+            profile = self.get(imported_key) if imported_key else None
+            if not profile:
+                tag = str(manifest.get("tag") or "")
+                profile = self.get_by_tag(tag) if tag else None
+            if not profile:
+                raise ValueError("Fandom backup import did not restore a fandom profile.")
+            return profile
+
+    def delete_clean(self, fandom_keys: list[str]) -> int:
+        clean_keys = [str(key) for key in dict.fromkeys(fandom_keys) if str(key).strip()]
+        if not clean_keys:
+            return 0
+        deleted = 0
+        with self.db.connect() as conn:
+            for key in clean_keys:
+                row = conn.execute("SELECT tag FROM fandom_profiles WHERE fandom_key = ?", (key,)).fetchone()
+                if not row:
+                    continue
+                candidate_work_ids = self._fandom_work_ids(conn, key, str(row["tag"]))
+                batch_ids = self._ids(conn, "SELECT id FROM evaluation_batches WHERE fandom_key = ?", [key])
+                if batch_ids:
+                    conn.execute(self._in_sql("DELETE FROM evaluation_queue WHERE batch_id IN ({})", batch_ids), batch_ids)
+                conn.execute("DELETE FROM work_collection WHERE fandom_key = ?", (key,))
+                conn.execute("DELETE FROM blocked_works WHERE fandom_key = ?", (key,))
+                conn.execute("DELETE FROM blocked_authors WHERE fandom_key = ?", (key,))
+                conn.execute("DELETE FROM blocked_tags WHERE fandom_key = ?", (key,))
+                conn.execute("DELETE FROM browse_snapshots WHERE context_type = 'fandom' AND context_key = ?", (row["tag"],))
+                conn.execute("DELETE FROM fandom_profiles WHERE fandom_key = ?", (key,))
+                deleted += 1
+                self._delete_now_unprotected_works(conn, candidate_work_ids)
+        return deleted
+
+    def list_directory_sources(self) -> list[FandomDirectorySource]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.*,
+                       COUNT(c.id) AS cached_count
+                FROM fandom_directory_sources s
+                LEFT JOIN fandom_directory_cache c ON c.media_key = s.media_key
+                GROUP BY s.media_key
+                ORDER BY
+                    CASE s.media_key
+                        WHEN 'Movies' THEN 0
+                        WHEN 'TV Shows' THEN 1
+                        WHEN 'Video Games' THEN 2
+                        WHEN 'Anime *a* Manga' THEN 3
+                        WHEN 'Books *a* Literature' THEN 4
+                        WHEN 'Cartoons *a* Comics *a* Graphic Novels' THEN 5
+                        ELSE 20
+                    END,
+                    s.label
+                """
+            ).fetchall()
+        return [self._directory_source_row(row) for row in rows]
+
+    def upsert_directory_source(self, source: FandomDirectorySource) -> None:
+        now = utc_now_iso()
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO fandom_directory_sources(media_key, label, url, color, enabled, cached_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(media_key) DO UPDATE SET
+                    label = excluded.label,
+                    url = excluded.url,
+                    color = excluded.color,
+                    enabled = excluded.enabled,
+                    cached_at = COALESCE(excluded.cached_at, fandom_directory_sources.cached_at),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    source.media_key,
+                    source.label,
+                    source.url,
+                    source.color or "#58a6ff",
+                    int(source.enabled),
+                    source.cached_at,
+                    now,
+                ),
+            )
+
+    def cache_directory_fandoms(self, media_key: str, suggestions: list[FandomSuggestion]) -> int:
+        now = utc_now_iso()
+        clean = [item for item in suggestions if item.tag.strip() and item.tag.strip().casefold() != "search"]
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM fandom_directory_cache WHERE media_key = ? AND lower(tag) = 'search'", (media_key,))
+            before = int(conn.execute("SELECT COUNT(*) FROM fandom_directory_cache WHERE media_key = ?", (media_key,)).fetchone()[0])
+            conn.executemany(
+                """
+                INSERT INTO fandom_directory_cache(media_key, tag, label, url, cached_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(media_key, tag) DO UPDATE SET
+                    label = excluded.label,
+                    url = excluded.url,
+                    cached_at = excluded.cached_at
+                """,
+                [
+                    (
+                        media_key,
+                        item.tag.strip(),
+                        item.label.strip() or item.tag.strip(),
+                        item.url.strip(),
+                        now,
+                    )
+                    for item in clean
+                ],
+            )
+            conn.execute("UPDATE fandom_directory_sources SET cached_at = ?, updated_at = ? WHERE media_key = ?", (now, now, media_key))
+            after = int(conn.execute("SELECT COUNT(*) FROM fandom_directory_cache WHERE media_key = ?", (media_key,)).fetchone()[0])
+        return max(0, after - before)
+
+    def suggest_directory_fandoms(self, query: str, limit: int = 24) -> list[FandomSuggestion]:
+        clean_query = " ".join(str(query or "").split())
+        if not clean_query:
+            return []
+        tokens = [token.casefold() for token in clean_query.split() if token.strip()]
+        where_sql = " AND ".join("(lower(c.tag) LIKE ? OR lower(c.label) LIKE ?)" for _ in tokens)
+        token_params: list[str] = []
+        for token in tokens:
+            token_params.extend([f"%{token}%", f"%{token}%"])
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT c.tag, c.label, c.url, c.media_key, s.label AS media_label, s.color
+                FROM fandom_directory_cache c
+                JOIN fandom_directory_sources s ON s.media_key = c.media_key
+                WHERE {where_sql}
+                ORDER BY
+                    CASE WHEN lower(c.tag) = lower(?) THEN 0
+                         WHEN lower(c.label) = lower(?) THEN 1
+                         WHEN lower(c.tag) LIKE lower(?) THEN 2
+                         WHEN lower(c.label) LIKE lower(?) THEN 3
+                         ELSE 4
+                    END,
+                    c.label
+                LIMIT ?
+                """,
+                (
+                    *token_params,
+                    clean_query,
+                    clean_query,
+                    f"{clean_query}%",
+                    f"{clean_query}%",
+                    limit,
+                ),
+            ).fetchall()
+        return [
+            FandomSuggestion(
+                tag=row["tag"],
+                label=row["label"],
+                url=row["url"],
+                media_key=row["media_key"],
+                media_label=row["media_label"],
+                color=row["color"],
+            )
+            for row in rows
+        ]
+
+    def delete_directory_cache(self, media_key: str) -> int:
+        with self.db.connect() as conn:
+            before = int(conn.execute("SELECT COUNT(*) FROM fandom_directory_cache WHERE media_key = ?", (media_key,)).fetchone()[0])
+            conn.execute("DELETE FROM fandom_directory_cache WHERE media_key = ?", (media_key,))
+            conn.execute("UPDATE fandom_directory_sources SET cached_at = NULL, updated_at = ? WHERE media_key = ?", (utc_now_iso(), media_key))
+        return before
+
+    def _export_fandom_rows(
+        self,
+        source: sqlite3.Connection,
+        dest: sqlite3.Connection,
+        fandom_key: str,
+        fandom_tag: str,
+    ) -> tuple[set[str], set[str], set[str]]:
+        direct_tables = [
+            "fandom_profiles",
+            "character_profiles",
+            "fandom_tag_catalog",
+            "fandom_style_overrides",
+            "work_collection",
+            "blocked_works",
+            "blocked_authors",
+            "blocked_tags",
+            "favorite_tags",
+            "tag_color_overrides",
+            "work_sets",
+            "evaluation_batches",
+        ]
+        for table in direct_tables:
+            self._copy_rows(source, dest, table, "fandom_key = ?", [fandom_key])
+        work_set_ids = self._ids(source, "SELECT id FROM work_sets WHERE fandom_key = ?", [fandom_key])
+        batch_ids = self._ids(source, "SELECT id FROM evaluation_batches WHERE fandom_key = ?", [fandom_key])
+        schema_keys = set(self._ids(source, "SELECT schema_key FROM evaluation_batches WHERE fandom_key = ?", [fandom_key]))
+        if work_set_ids:
+            self._copy_rows_in(source, dest, "work_set_pages", "set_id", work_set_ids)
+            self._copy_rows_in(source, dest, "work_set_items", "set_id", work_set_ids)
+        if batch_ids:
+            self._copy_rows_in(source, dest, "evaluation_queue", "batch_id", batch_ids)
+            schema_keys.update(self._ids(source, self._in_sql("SELECT schema_key FROM evaluation_queue WHERE batch_id IN ({})", batch_ids), batch_ids))
+        snapshot_rows = source.execute(
+            "SELECT * FROM browse_snapshots WHERE context_type = 'fandom' AND context_key = ?",
+            (fandom_tag,),
+        ).fetchall()
+        self._insert_rows(dest, "browse_snapshots", snapshot_rows)
+        work_ids = self._fandom_work_ids(source, fandom_key, fandom_tag)
+        if work_ids:
+            self._copy_rows_in(source, dest, "works", "work_id", sorted(work_ids))
+            self._copy_rows_in(source, dest, "work_tags", "work_id", sorted(work_ids))
+            self._copy_rows_in(source, dest, "work_publication_dates", "work_id", sorted(work_ids))
+            self._copy_rows_in(source, dest, "reader_assets", "work_id", sorted(work_ids))
+            self._copy_rows_in(source, dest, "reader_chapters", "work_id", sorted(work_ids))
+            self._copy_rows_in(source, dest, "evaluations_local", "work_id", sorted(work_ids))
+            self._copy_rows_in(source, dest, "reading_state", "work_id", sorted(work_ids))
+            self._copy_rows_in(source, dest, "work_rarity_local", "work_id", sorted(work_ids))
+            self._copy_rows_in(source, dest, "shared_overlay_cache", "work_id", sorted(work_ids))
+            schema_keys.update(self._ids(source, self._in_sql("SELECT schema_key FROM evaluations_local WHERE work_id IN ({})", sorted(work_ids)), sorted(work_ids)))
+        if schema_keys:
+            self._copy_rows_in(source, dest, "schemas_local", "schema_key", sorted(schema_keys))
+        local_user_ids = set()
+        if work_ids:
+            local_user_ids.update(self._ids(source, self._in_sql("SELECT local_user_id FROM evaluations_local WHERE work_id IN ({})", sorted(work_ids)), sorted(work_ids)))
+            local_user_ids.update(self._ids(source, self._in_sql("SELECT local_user_id FROM reading_state WHERE work_id IN ({})", sorted(work_ids)), sorted(work_ids)))
+            local_user_ids.update(self._ids(source, self._in_sql("SELECT local_user_id FROM work_rarity_local WHERE work_id IN ({})", sorted(work_ids)), sorted(work_ids)))
+        if local_user_ids:
+            self._copy_rows_in(source, dest, "local_user", "id", sorted(local_user_ids))
+        return work_ids, schema_keys, local_user_ids
+
+    def _import_fandom_rows(self, source: sqlite3.Connection, dest: sqlite3.Connection) -> None:
+        for table in [
+            "local_user",
+            "schemas_local",
+            "fandom_profiles",
+            "works",
+            "work_tags",
+            "work_publication_dates",
+            "character_profiles",
+            "fandom_style_overrides",
+            "fandom_tag_catalog",
+            "favorite_tags",
+            "tag_color_overrides",
+            "work_collection",
+            "blocked_works",
+            "blocked_authors",
+            "blocked_tags",
+            "reader_assets",
+            "reader_chapters",
+            "reading_state",
+            "work_rarity_local",
+            "shared_overlay_cache",
+            "browse_snapshots",
+            "work_sets",
+            "work_set_pages",
+            "work_set_items",
+            "evaluation_batches",
+            "evaluation_queue",
+            "evaluations_local",
+        ]:
+            if self._table_exists(source, table):
+                self._insert_rows(dest, table, source.execute(f"SELECT * FROM {table}").fetchall())
+
+    def _fandom_work_ids(self, conn: sqlite3.Connection, fandom_key: str, fandom_tag: str) -> set[str]:
+        work_ids = set(self._ids(conn, "SELECT work_id FROM work_collection WHERE fandom_key = ?", [fandom_key]))
+        work_ids.update(self._ids(conn, "SELECT work_id FROM blocked_works WHERE fandom_key = ?", [fandom_key]))
+        set_ids = self._ids(conn, "SELECT id FROM work_sets WHERE fandom_key = ?", [fandom_key])
+        if set_ids:
+            work_ids.update(self._ids(conn, self._in_sql("SELECT work_id FROM work_set_items WHERE set_id IN ({})", set_ids), set_ids))
+            page_rows = conn.execute(self._in_sql("SELECT work_ids_json FROM work_set_pages WHERE set_id IN ({})", set_ids), set_ids).fetchall()
+            for row in page_rows:
+                work_ids.update(str(work_id) for work_id in _json_loads(row["work_ids_json"], []) if str(work_id).strip())
+        batch_ids = self._ids(conn, "SELECT id FROM evaluation_batches WHERE fandom_key = ?", [fandom_key])
+        if batch_ids:
+            work_ids.update(self._ids(conn, self._in_sql("SELECT work_id FROM evaluation_queue WHERE batch_id IN ({})", batch_ids), batch_ids))
+        snapshot_rows = conn.execute(
+            "SELECT work_ids_json FROM browse_snapshots WHERE context_type = 'fandom' AND context_key = ?",
+            (fandom_tag,),
+        ).fetchall()
+        for row in snapshot_rows:
+            work_ids.update(str(work_id) for work_id in _json_loads(row["work_ids_json"], []) if str(work_id).strip())
+        return work_ids
+
+    def _delete_now_unprotected_works(self, conn: sqlite3.Connection, work_ids: set[str]) -> None:
+        for work_id in sorted(work_ids):
+            if self._work_has_protection(conn, work_id):
+                continue
+            conn.execute("DELETE FROM works WHERE work_id = ?", (work_id,))
+
+    def _work_has_protection(self, conn: sqlite3.Connection, work_id: str) -> bool:
+        checks = [
+            ("work_collection", "work_id"),
+            ("blocked_works", "work_id"),
+            ("evaluation_queue", "work_id"),
+            ("work_set_items", "work_id"),
+        ]
+        for table, column in checks:
+            if conn.execute(f"SELECT 1 FROM {table} WHERE {column} = ? LIMIT 1", (work_id,)).fetchone():
+                return True
+        snapshot_rows = conn.execute("SELECT work_ids_json FROM browse_snapshots").fetchall()
+        for row in snapshot_rows:
+            if work_id in {str(item) for item in _json_loads(row["work_ids_json"], [])}:
+                return True
+        return False
+
+    def _fandom_file_map(self, conn: sqlite3.Connection, fandom_key: str) -> dict[str, Path]:
+        file_map: dict[str, Path] = {}
+        rows = conn.execute("SELECT avatar_url FROM fandom_profiles WHERE fandom_key = ?", (fandom_key,)).fetchall()
+        rows += conn.execute("SELECT avatar_url FROM character_profiles WHERE fandom_key = ?", (fandom_key,)).fetchall()
+        for row in rows:
+            avatar_url = str(row["avatar_url"] or "")
+            if avatar_url.startswith("/fandom-avatars/"):
+                filename = Path(avatar_url.split("?", 1)[0]).name
+                file_map[f"fandom_avatars/{filename}"] = FANDOM_AVATAR_DIR / filename
+            elif avatar_url.startswith("/character-avatars/"):
+                filename = Path(avatar_url.split("?", 1)[0]).name
+                file_map[f"character_avatars/{filename}"] = CHARACTER_AVATAR_DIR / filename
+        return file_map
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+        return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone())
+
+    @staticmethod
+    def _ids(conn: sqlite3.Connection, sql: str, params: list[Any]) -> list[str]:
+        return [str(row[0]) for row in conn.execute(sql, params).fetchall() if str(row[0] or "").strip()]
+
+    @staticmethod
+    def _in_sql(template: str, values: list[Any]) -> str:
+        placeholders = ",".join("?" for _ in values)
+        return template.format(placeholders)
+
+    def _copy_rows(self, source: sqlite3.Connection, dest: sqlite3.Connection, table: str, where_sql: str, params: list[Any]) -> None:
+        rows = source.execute(f"SELECT * FROM {table} WHERE {where_sql}", params).fetchall()
+        self._insert_rows(dest, table, rows)
+
+    def _copy_rows_in(self, source: sqlite3.Connection, dest: sqlite3.Connection, table: str, column: str, values: list[Any]) -> None:
+        if not values:
+            return
+        rows = source.execute(self._in_sql(f"SELECT * FROM {table} WHERE {column} IN ({{}})", values), values).fetchall()
+        self._insert_rows(dest, table, rows)
+
+    @staticmethod
+    def _insert_rows(dest: sqlite3.Connection, table: str, rows: list[sqlite3.Row]) -> None:
+        if not rows:
+            return
+        columns = list(rows[0].keys())
+        placeholders = ",".join("?" for _ in columns)
+        column_sql = ",".join(columns)
+        dest.executemany(
+            f"INSERT OR REPLACE INTO {table}({column_sql}) VALUES ({placeholders})",
+            [tuple(row[column] for column in columns) for row in rows],
+        )
+
+    @staticmethod
+    def _directory_source_row(row) -> FandomDirectorySource:
+        return FandomDirectorySource(
+            media_key=row["media_key"],
+            label=row["label"],
+            url=row["url"],
+            color=row["color"],
+            enabled=_bool(row["enabled"]),
+            cached_at=row["cached_at"],
+            updated_at=row["updated_at"],
+            cached_count=int(row["cached_count"] if "cached_count" in row.keys() else 0),
+        )
+
     @staticmethod
     def _row(row) -> FandomProfile:
         return FandomProfile(
@@ -630,8 +1128,8 @@ class SQLiteCharacterProfileRepository:
                 conn.execute(
                     """
                     INSERT INTO character_profiles(
-                        id, fandom_key, name, full_name, color, avatar_url, tag_urls_json, notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        id, fandom_key, name, full_name, color, avatar_url, tag_urls_json, notes, reader_style_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         character.id,
@@ -642,6 +1140,7 @@ class SQLiteCharacterProfileRepository:
                         character.avatar_url,
                         _json_dumps(character.tag_urls),
                         character.notes,
+                        _json_dumps(character.reader_style),
                         created_at,
                         now,
                     ),
@@ -657,6 +1156,7 @@ class SQLiteCharacterProfileRepository:
                     avatar_url = ?,
                     tag_urls_json = ?,
                     notes = ?,
+                    reader_style_json = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -668,6 +1168,7 @@ class SQLiteCharacterProfileRepository:
                     character.avatar_url,
                     _json_dumps(character.tag_urls),
                     character.notes,
+                    _json_dumps(character.reader_style),
                     now,
                     target_id,
                 ),
@@ -687,6 +1188,7 @@ class SQLiteCharacterProfileRepository:
 
     @staticmethod
     def _row(row) -> CharacterProfile:
+        reader_style = _json_loads(row["reader_style_json"], {}) if "reader_style_json" in row.keys() else {}
         return CharacterProfile(
             id=row["id"],
             fandom_key=row["fandom_key"],
@@ -696,6 +1198,7 @@ class SQLiteCharacterProfileRepository:
             avatar_url=row["avatar_url"],
             tag_urls=list(_json_loads(row["tag_urls_json"], [])),
             notes=row["notes"] if "notes" in row.keys() else None,
+            reader_style=dict(reader_style) if isinstance(reader_style, dict) else {},
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -1161,8 +1664,10 @@ class SQLiteWorkCollectionRepository:
             ).fetchall()
         return [SQLiteWorkRepository._row(row) for row in rows]
 
-    def count(self) -> int:
+    def count(self, fandom_key: str | None = None) -> int:
         with self.db.connect() as conn:
+            if fandom_key:
+                return int(conn.execute("SELECT COUNT(*) FROM work_collection WHERE fandom_key = ?", (fandom_key,)).fetchone()[0])
             return int(conn.execute("SELECT COUNT(*) FROM work_collection").fetchone()[0])
 
 
@@ -1666,6 +2171,49 @@ class SQLiteEvaluationRepository:
     def count(self) -> int:
         with self.db.connect() as conn:
             return int(conn.execute("SELECT COUNT(*) FROM evaluations_local").fetchone()[0])
+
+    def count_for_fandom(self, local_user_id: str, fandom_key: str, fandom_tag: str) -> int:
+        with self.db.connect() as conn:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT evaluations_local.id)
+                    FROM evaluations_local
+                    WHERE evaluations_local.local_user_id = ?
+                      AND (
+                        EXISTS (
+                            SELECT 1
+                            FROM work_tags
+                            WHERE work_tags.work_id = evaluations_local.work_id
+                              AND work_tags.tag_type = ?
+                              AND work_tags.tag_text = ?
+                        )
+                         OR EXISTS (
+                            SELECT 1
+                            FROM work_collection
+                            WHERE work_collection.work_id = evaluations_local.work_id
+                              AND work_collection.fandom_key = ?
+                        )
+                         OR EXISTS (
+                            SELECT 1
+                            FROM work_set_items
+                            JOIN work_sets ON work_sets.id = work_set_items.set_id
+                            WHERE work_set_items.work_id = evaluations_local.work_id
+                              AND work_sets.fandom_key = ?
+                        )
+                         OR EXISTS (
+                            SELECT 1
+                            FROM evaluation_batches
+                            JOIN work_sets ON work_sets.id = evaluation_batches.work_set_id
+                            JOIN work_set_items ON work_set_items.set_id = work_sets.id
+                            WHERE work_set_items.work_id = evaluations_local.work_id
+                              AND evaluation_batches.fandom_key = ?
+                        )
+                      )
+                    """,
+                    (local_user_id, TagType.FANDOM.value, fandom_tag, fandom_key, fandom_key, fandom_key),
+                ).fetchone()[0]
+            )
 
     def delete_for_works_schema(self, work_ids: list[str], local_user_id: str, schema_key: str) -> int:
         ids = [str(work_id) for work_id in dict.fromkeys(work_ids) if str(work_id).strip()]

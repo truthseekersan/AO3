@@ -24,7 +24,8 @@ class SQLiteDatabase:
         return conn
 
     def migrate(self) -> None:
-        with self.connect() as conn:
+        conn = self.connect()
+        try:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if version < 1:
                 self._migrate_v1(conn)
@@ -77,6 +78,17 @@ class SQLiteDatabase:
             if version < 13:
                 self._migrate_v13(conn)
                 conn.execute("PRAGMA user_version = 13")
+                version = 13
+            if version < 14:
+                self._migrate_v14(conn)
+                conn.execute("PRAGMA user_version = 14")
+                version = 14
+            if version < 15:
+                self._migrate_v15(conn)
+                conn.execute("PRAGMA user_version = 15")
+            conn.commit()
+        finally:
+            conn.close()
 
     @staticmethod
     def _migrate_v1(conn: sqlite3.Connection) -> None:
@@ -683,6 +695,47 @@ class SQLiteDatabase:
         if "full_name" not in columns:
             conn.execute("ALTER TABLE character_profiles ADD COLUMN full_name TEXT NOT NULL DEFAULT ''")
         conn.execute("UPDATE character_profiles SET full_name = name WHERE full_name IS NULL OR full_name = ''")
+
+    @staticmethod
+    def _migrate_v14(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(character_profiles)").fetchall()
+        }
+        if "reader_style_json" not in columns:
+            conn.execute("ALTER TABLE character_profiles ADD COLUMN reader_style_json TEXT NOT NULL DEFAULT '{}'")
+
+    @staticmethod
+    def _migrate_v15(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS fandom_directory_sources (
+                media_key TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                url TEXT NOT NULL,
+                color TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                cached_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS fandom_directory_cache (
+                id INTEGER PRIMARY KEY,
+                media_key TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                label TEXT NOT NULL,
+                url TEXT NOT NULL,
+                cached_at TEXT NOT NULL,
+                FOREIGN KEY(media_key) REFERENCES fandom_directory_sources(media_key) ON DELETE CASCADE,
+                UNIQUE(media_key, tag)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fandom_directory_cache_lookup
+                ON fandom_directory_cache(tag, label);
+            CREATE INDEX IF NOT EXISTS idx_fandom_directory_cache_media
+                ON fandom_directory_cache(media_key, tag);
+            """
+        )
 
     @staticmethod
     def _stable_batch_id(work_set_id: str, schema_key: str) -> str:

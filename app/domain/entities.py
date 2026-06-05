@@ -99,6 +99,7 @@ class CharacterProfile:
     avatar_url: str | None = None
     tag_urls: list[str] = field(default_factory=list)
     notes: str | None = None
+    reader_style: JsonDict = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
 
@@ -112,6 +113,28 @@ class FandomTagCatalogItem:
     source: str = "ao3"
     fetched_at: str = ""
     id: int | None = None
+
+
+@dataclass(slots=True)
+class FandomSuggestion:
+    tag: str
+    label: str
+    url: str
+    media_key: str = ""
+    media_label: str = ""
+    color: str = "#58a6ff"
+
+
+@dataclass(slots=True)
+class FandomDirectorySource:
+    media_key: str
+    label: str
+    url: str
+    color: str
+    enabled: bool = False
+    cached_at: str | None = None
+    updated_at: str = ""
+    cached_count: int = 0
 
 
 @dataclass(slots=True)

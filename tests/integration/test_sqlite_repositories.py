@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from zipfile import ZipFile
+import io
 from dataclasses import replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -12,6 +14,7 @@ from app.application.composition import build_container
 from app.application.services import (
     AO3BrowseService,
     QueueEvaluationConfig,
+    STYLE_OVERRIDE_SECTIONS_KEY,
     fandom_key,
     filter_signature,
     normalize_ao3_date_filter,
@@ -21,7 +24,11 @@ from app.application.services import (
 from app.domain.entities import (
     BrowseSnapshot,
     EvaluationBatch,
+    Evaluation,
+    EvaluationQueueItem,
+    FandomDirectorySource,
     FandomProfile,
+    FandomSuggestion,
     ReaderAsset,
     ReaderChapter,
     ReadingState,
@@ -419,11 +426,26 @@ def test_queue_cleanup_archives_partial_batch_and_preserves_evaluated_results(tm
     assert len(evaluated) == 1
     assert evaluated[0].completed_count == 1
     assert container.evaluation_service.latest_for_work("queue-clean-a", schema.schema_key) is not None
+    assert container.queue_service.pending_works_for_batch(batch.id).works == []
+
+    container.work_repo.upsert(
+        Work("queue-clean-c", "https://archiveofourown.org/works/queue-clean-c", title="queue-clean-c", last_scraped_at="2026-01-01T00:00:00Z")
+    )
+    manual = container.queue_service.queue_work_to_named_cluster(
+        fandom_key=profile.fandom_key,
+        cluster_name="Queue Cleanup Cluster",
+        work_id="queue-clean-c",
+        schema_key=schema.schema_key,
+    )
+
+    assert manual.ok
+    assert {item.work_id for item in container.queue_repo.list(batch_id=batch.id)} == {"queue-clean-c"}
+    assert {work.work_id for work in container.queue_service.pending_works_for_batch(batch.id).works} == {"queue-clean-c"}
 
     requeued = container.queue_service.create_queue_for_schema_slot(work_set.id, schema.schema_key)
 
     assert requeued.ok
-    assert {item.work_id for item in container.queue_repo.list(batch_id=batch.id)} == {"queue-clean-b"}
+    assert {item.work_id for item in container.queue_repo.list(batch_id=batch.id)} == {"queue-clean-b", "queue-clean-c"}
     assert container.batch_repo.get(batch.id).status is EvaluationBatchStatus.PARTIAL
 
 
@@ -463,25 +485,91 @@ def test_cluster_metadata_persists_and_favorites_sort_first(tmp_path) -> None:
     )
 
     assert result.ok
+    rename = container.queue_service.update_cluster_metadata(
+        favorite.payload["work_set"].id,
+        name="Renamed Favorite Cluster",
+    )
+
+    assert rename.ok
+    assert container.work_set_repo.get(favorite.payload["work_set"].id).name == "Renamed Favorite Cluster"
+    assert not container.queue_service.update_cluster_metadata(favorite.payload["work_set"].id, name="Plain Cluster").ok
+    assert not container.queue_service.update_cluster_metadata(favorite.payload["work_set"].id, name=" ").ok
     summaries = container.queue_service.list_queue_batches(profile.fandom_key)
-    assert [summary.work_set.name for summary in summaries[:2]] == ["Favorite Cluster", "Plain Cluster"]
+    assert [summary.work_set.name for summary in summaries[:2]] == ["Renamed Favorite Cluster", "Plain Cluster"]
     stored = container.work_set_repo.get(favorite.payload["work_set"].id)
     assert stored.filter_state["_cluster_meta"] == {
         "color": "#ff66aa",
         "favorite": True,
         "description": "Evaluate the weird page first.",
     }
-    refreshed = container.queue_service.save_page_as_evaluation_queue(
+    renamed_refresh = container.queue_service.save_page_as_evaluation_queue(
         fandom_key=profile.fandom_key,
-        name="Favorite Cluster",
+        name="Renamed Favorite Cluster",
         filter_state={"fandom": profile.tag, "sort_column": "created_at", "page": 2},
         source_url="https://example.test/favorite-2",
         work_ids=["favorite-work"],
         page_number=2,
         schema_key=schema.schema_key,
     )
-    assert refreshed.ok
+    assert renamed_refresh.ok
     assert container.work_set_repo.get(favorite.payload["work_set"].id).filter_state["_cluster_meta"]["color"] == "#ff66aa"
+
+
+def test_manual_named_queue_targets_existing_or_new_cluster_without_default_drawer(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    profile = container.fandom_service.ensure_default()
+    schema = container.schema_service.active_schema()
+    for work_id in ["manual-new", "manual-evaluated", "manual-extra"]:
+        container.work_repo.upsert(
+            Work(work_id, f"https://archiveofourown.org/works/{work_id}", title=work_id, last_scraped_at="2026-01-01T00:00:00Z")
+        )
+    container.evaluation_service.save_manual(
+        work_id="manual-evaluated",
+        schema_key=schema.schema_key,
+        scores={"story_fit": 8, "craft": 8, "emotional_pull": 8},
+        status=EvaluationStatus.COMPLETE,
+    )
+
+    created = container.queue_service.queue_work_to_named_cluster(
+        fandom_key=profile.fandom_key,
+        cluster_name="Named Manual",
+        work_id="manual-new",
+        schema_key=schema.schema_key,
+    )
+    evaluated = container.queue_service.queue_work_to_named_cluster(
+        fandom_key=profile.fandom_key,
+        cluster_name="Named Manual",
+        work_id="manual-evaluated",
+        schema_key=schema.schema_key,
+    )
+    extra = container.queue_service.queue_work_to_named_cluster(
+        fandom_key=profile.fandom_key,
+        cluster_name="Another Manual",
+        work_id="manual-extra",
+        schema_key=schema.schema_key,
+    )
+    duplicate = container.queue_service.queue_work_to_named_cluster(
+        fandom_key=profile.fandom_key,
+        cluster_name="Named Manual",
+        work_id="manual-new",
+        schema_key=schema.schema_key,
+    )
+
+    assert created.ok
+    assert evaluated.ok
+    assert extra.ok
+    assert duplicate.ok
+    assert "already in Named Manual" in duplicate.message
+    manual_set = container.work_set_repo.get_by_name(profile.fandom_key, "Manual Queue")
+    assert manual_set is None
+    named_set = container.work_set_repo.get_by_name(profile.fandom_key, "Named Manual")
+    assert named_set is not None
+    batch = container.batch_repo.get_by_work_set_schema(named_set.id, schema.schema_key)
+    assert batch is not None
+    assert {item.work_id for item in container.queue_repo.list(batch_id=batch.id)} == {"manual-new"}
+    assert {work.work_id for work in container.queue_service.pending_works_for_batch(batch.id).works} == {"manual-new"}
+    assert [work.work_id for work in container.queue_service.evaluated_works_for_batch(batch.id).works] == ["manual-evaluated"]
+    assert [target.name for target in container.queue_service.cluster_targets(profile.fandom_key)] == ["Another Manual", "Named Manual"]
 
 
 def test_evaluated_batch_delete_removes_only_unprotected_cached_work(tmp_path) -> None:
@@ -1070,6 +1158,44 @@ def test_fandom_tag_catalog_is_cached_per_fandom(tmp_path) -> None:
     assert all(item.fandom_key == profile.fandom_key for item in suggestions)
 
 
+def test_character_reader_style_round_trips_through_sqlite(tmp_path) -> None:
+    db_path = tmp_path / "ao3.sqlite"
+    container = build_container(db_path)
+    profile = FandomProfile(
+        fandom_key=fandom_key("Life is Strange"),
+        tag="Life is Strange",
+        display_name="Life is Strange",
+        color="#58a6ff",
+    )
+    container.fandom_service.save_profile(profile)
+
+    result = container.fandom_service.save_character(
+        fandom_key=profile.fandom_key,
+        name="Max",
+        full_name="Maxine Caulfield",
+        color="#58a6ff",
+        reader_style={
+            "font_family": "'Newsreader', serif",
+            "custom_font_enabled": True,
+            "font_size": 21.5,
+            "font_size_enabled": True,
+        },
+    )
+
+    assert result.ok
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] >= 14
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(character_profiles)").fetchall()}
+    assert "reader_style_json" in columns
+    [character] = container.fandom_service.list_characters(profile.fandom_key)
+    assert character.reader_style == {
+        "font_family": "'Newsreader', serif",
+        "custom_font_enabled": True,
+        "font_size": 21.5,
+        "font_size_enabled": True,
+    }
+
+
 def test_work_sets_and_favorite_tags_round_trip(tmp_path) -> None:
     container = build_container(tmp_path / "ao3.sqlite")
     profile = FandomProfile(fandom_key=fandom_key("Fandom"), tag="Fandom", display_name="Fandom")
@@ -1099,6 +1225,117 @@ def test_work_sets_and_favorite_tags_round_trip(tmp_path) -> None:
     assert color_result.ok
     assert container.work_library_service.tag_colors_for_fandom(profile.fandom_key)[0].tag_text == "Toxic Vibes"
     assert [favorite.tag_text for favorite in container.work_library_service.favorite_tags_for_fandom(profile.fandom_key)] == ["Maxine Caulfield"]
+
+
+def test_fandom_backup_zip_exports_deletes_and_imports_scoped_data(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    profile = container.fandom_service.save_profile(
+        FandomProfile(
+            fandom_key=fandom_key("Fandom Backup"),
+            tag="Fandom Backup",
+            display_name="Fandom Backup",
+            color="#58a6ff",
+            avatar_url="/fandom-avatars/fandom_backup.png",
+            default_filter={"fandom": "Fandom Backup", "sort_column": "revised_at"},
+        )
+    )
+    container.fandom_service.select(profile.fandom_key)
+    work = Work("backup-work", "https://archiveofourown.org/works/backup-work", title="Backup Work", last_scraped_at="2026-01-01T00:00:00Z")
+    container.work_repo.upsert(work)
+    container.tag_repo.replace_for_work("backup-work", [WorkTag("backup-work", TagType.FANDOM, "Fandom Backup")])
+    container.reader_asset_repo.replace_document(
+        ReaderAsset(
+            work_id="backup-work",
+            source_format="html",
+            source_url=work.ao3_url,
+            download_url="https://archiveofourown.org/downloads/backup-work.html",
+            content_hash="abc",
+            downloaded_chapter_count=1,
+            known_ao3_chapter_count=1,
+            downloaded_at="2026-01-01T00:00:00Z",
+            last_checked_at="2026-01-01T00:00:00Z",
+        ),
+        [ReaderChapter("backup-work", 1, "One", work.ao3_url, "chapter-1", "<p>Backup text.</p>", "h")],
+    )
+    container.fandom_service.save_character(
+        fandom_key=profile.fandom_key,
+        character_id="backup-character",
+        name="Max",
+        full_name="Maxine Caulfield",
+        color="#58a6ff",
+        avatar_url="/character-avatars/character_backup.png",
+    )
+    state = {"fandom": "Fandom Backup", "page": 1}
+    work_set = WorkSet(
+        id="backup-set",
+        fandom_key=profile.fandom_key,
+        name="Backup Set",
+        filter_state=state,
+        filter_signature=filter_signature(state),
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+    container.work_set_repo.save(work_set)
+    container.work_set_repo.add_items(work_set.id, [work.work_id])
+    container.batch_repo.save(
+        EvaluationBatch(
+            id="backup-batch",
+            work_set_id=work_set.id,
+            fandom_key=profile.fandom_key,
+            schema_key="local_default_v1",
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+    )
+    container.queue_repo.add(
+        EvaluationQueueItem(
+            id="backup-queue",
+            work_id=work.work_id,
+            priority=100,
+            queue_status=QueueStatus.QUEUED,
+            requested_at="2026-01-01T00:00:00Z",
+            batch_id="backup-batch",
+            schema_key="local_default_v1",
+        )
+    )
+    local_id = container.identity_service.bootstrap().local_user_id
+    container.evaluation_repo.save(
+        Evaluation(
+            id="backup-eval",
+            work_id=work.work_id,
+            local_user_id=local_id,
+            schema_key="local_default_v1",
+            schema_version="1.0.0",
+            scores={"craft": 8},
+            status=EvaluationStatus.COMPLETE,
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+    )
+
+    filename, payload = container.fandom_service.export_fandom_backup(profile.fandom_key)
+
+    assert filename.endswith(".ao3fandom.zip")
+    with ZipFile(io.BytesIO(payload), "r") as archive:
+        assert {"manifest.json", "fandom.sqlite"} <= set(archive.namelist())
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["fandom_key"] == profile.fandom_key
+        assert manifest["work_count"] == 1
+
+    result = container.fandom_service.delete_fandoms_after_backup([profile.fandom_key])
+    assert result.ok
+    assert container.fandom_repo.get(profile.fandom_key) is None
+    assert container.work_repo.get(work.work_id) is None
+
+    restored = container.fandom_service.import_fandom_backup(payload)
+
+    assert restored.fandom_key == profile.fandom_key
+    assert container.work_repo.get(work.work_id).title == "Backup Work"
+    assert container.reader_asset_repo.get_asset(work.work_id).content_hash == "abc"
+    assert container.work_set_repo.list_work_ids(work_set.id) == [work.work_id]
+    assert container.queue_repo.get("backup-queue").work_id == work.work_id
+    assert container.evaluation_repo.latest_for_work(work.work_id, local_id, "local_default_v1").scores == {"craft": 8}
+    assert container.fandom_service.list_characters(profile.fandom_key)[0].name == "Max"
 
 
 def test_reader_asset_and_position_round_trip(tmp_path) -> None:
@@ -1470,6 +1707,229 @@ def test_style_override_precedence_and_font_wheel_targets_fandom(tmp_path) -> No
 
     assert container.style_service.effective_settings(profile.fandom_key)["reader_font_size"] == 22.5
     assert container.style_service.global_settings()["reader_font_size"] == 18
+
+
+def test_style_override_sections_are_independent_and_font_wheel_respects_font_section(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    profile = FandomProfile(fandom_key=fandom_key("Fandom Sections"), tag="Fandom Sections", display_name="Fandom Sections", color="#58a6ff")
+    container.fandom_service.save_profile(profile)
+
+    container.style_service.save_global_settings(
+        {
+            "preview_font_family": "'Source Code Pro', monospace",
+            "reader_font_size": 18,
+            "font_wheel_step_px": 1.0,
+            "border_thickness": 1,
+            "gradient_border_enabled": False,
+        }
+    )
+    container.style_service.save_fandom_override(
+        profile.fandom_key,
+        True,
+        {
+            "preview_font_family": "'Recursive', monospace",
+            "reader_font_size": 22,
+            "font_wheel_step_px": 0.5,
+            "border_thickness": 4,
+            "gradient_border_enabled": True,
+            STYLE_OVERRIDE_SECTIONS_KEY: {"font": True, "rarity": False},
+        },
+    )
+
+    font_only = container.style_service.effective_settings(profile.fandom_key)
+    assert font_only["preview_font_family"] == "'Recursive', monospace"
+    assert font_only["reader_font_size"] == 22
+    assert font_only["border_thickness"] == 1
+    assert font_only["gradient_border_enabled"] is False
+
+    container.style_service.save_fandom_override(
+        profile.fandom_key,
+        True,
+        {
+            "preview_font_family": "'Recursive', monospace",
+            "reader_font_size": 22,
+            "font_wheel_step_px": 0.5,
+            "border_thickness": 4,
+            "gradient_border_enabled": True,
+            STYLE_OVERRIDE_SECTIONS_KEY: {"font": False, "rarity": True},
+        },
+    )
+
+    rarity_only = container.style_service.effective_settings(profile.fandom_key)
+    assert rarity_only["preview_font_family"] == "'Source Code Pro', monospace"
+    assert rarity_only["reader_font_size"] == 18
+    assert rarity_only["border_thickness"] == 4
+    assert rarity_only["gradient_border_enabled"] is True
+
+    container.style_service.adjust_font_size(profile.fandom_key, 1)
+
+    after_global_wheel = container.style_service.effective_settings(profile.fandom_key)
+    assert container.style_service.global_settings()["reader_font_size"] == 19
+    assert after_global_wheel["reader_font_size"] == 19
+    assert after_global_wheel["border_thickness"] == 4
+    assert container.style_service.override_sections(container.style_service.fandom_override(profile.fandom_key)) == {"font": False, "rarity": True}
+
+
+def test_fandom_directory_cache_defaults_incremental_suggestions_and_delete(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+
+    sources = container.fandom_service.ensure_fandom_directory_sources()
+    by_key = {source.media_key: source for source in sources}
+    assert by_key["Movies"].enabled is True
+    assert by_key["TV Shows"].enabled is True
+    assert by_key["Video Games"].color == "#7ee787"
+    assert by_key["Anime *a* Manga"].label == "Anime & Manga"
+    assert by_key["Books *a* Literature"].enabled is True
+    assert by_key["Cartoons *a* Comics *a* Graphic Novels"].label == "Cartoons & Comics & Graphic Novels"
+    assert by_key["Cartoons *a* Comics *a* Graphic Novels"].enabled is True
+
+    container.fandom_repo.cache_directory_fandoms(
+        "Video Games",
+        [
+            FandomSuggestion(
+                tag="Life is Strange (Video Games 2015 2017 2024 2026)",
+                label="Life is Strange (Video Games 2015 2017 2024 2026)",
+                url="https://archiveofourown.org/tags/Life%20is%20Strange%20(Video%20Games%202015%202017%202024%202026)/works",
+            ),
+            FandomSuggestion(
+                tag="Portal",
+                label="Portal",
+                url="https://archiveofourown.org/tags/Portal/works",
+            ),
+        ],
+    )
+    container.fandom_repo.cache_directory_fandoms(
+        "Video Games",
+        [
+            FandomSuggestion(
+                tag="Portal",
+                label="Portal",
+                url="https://archiveofourown.org/tags/Portal/works",
+            ),
+            FandomSuggestion(
+                tag="search",
+                label="Tags",
+                url="https://archiveofourown.org/tags/search",
+            ),
+            FandomSuggestion(
+                tag="Mass Effect Trilogy",
+                label="Mass Effect Trilogy",
+                url="https://archiveofourown.org/tags/Mass%20Effect%20Trilogy/works",
+            ),
+        ],
+    )
+
+    suggestions = container.fandom_service.suggest_fandoms("life strange", 10)
+    assert len(suggestions) == 1
+    assert suggestions[0].tag == "Life is Strange (Video Games 2015 2017 2024 2026)"
+    assert suggestions[0].media_label == "Video Games"
+    assert suggestions[0].color == "#7ee787"
+
+    assert container.fandom_service.suggest_fandoms("portal", 10)[0].tag == "Portal"
+    assert container.fandom_service.suggest_fandoms("search", 10) == []
+    assert container.fandom_service.delete_fandom_directory_cache("Video Games").ok
+    assert container.fandom_service.suggest_fandoms("portal", 10) == []
+
+
+def test_fandom_directory_service_caches_selected_sources_with_fake_ao3(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    container.fandom_repo.upsert_directory_source(
+        FandomDirectorySource(
+            media_key="Custom Type",
+            label="Custom Type",
+            url="https://archiveofourown.org/media/Custom/fandoms",
+            color="#abcdef",
+            enabled=True,
+        )
+    )
+
+    class FakeAO3Client:
+        def fetch_media_fandoms(self, media_key: str, label: str, url: str, color: str):
+            assert media_key == "Custom Type"
+            assert label == "Custom Type"
+            assert color == "#abcdef"
+            return [
+                FandomSuggestion(
+                    tag="Custom Fandom",
+                    label="Custom Fandom",
+                    url="https://archiveofourown.org/tags/Custom%20Fandom/works",
+                    media_key=media_key,
+                    media_label=label,
+                    color=color,
+                )
+            ]
+
+    container.fandom_service.ao3_client = FakeAO3Client()
+
+    result = container.fandom_service.cache_fandom_directory_sources(["Custom Type"])
+
+    assert result.ok
+    [suggestion] = container.fandom_service.suggest_fandoms("custom", 5)
+    assert suggestion.tag == "Custom Fandom"
+    assert suggestion.media_key == "Custom Type"
+    assert suggestion.color == "#abcdef"
+
+
+def test_left_summary_counts_are_scoped_to_active_fandom(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    life = container.fandom_service.ensure_default()
+    titanic = container.fandom_service.save_profile(
+        FandomProfile(
+            fandom_key=fandom_key("Titanic (1997)"),
+            tag="Titanic (1997)",
+            display_name="Titanic",
+            color="#58a6ff",
+        )
+    )
+    orphan = Work(
+        "orphan",
+        "https://archiveofourown.org/works/orphan",
+        title="Orphan Cache",
+        last_scraped_at="2026-01-01T00:00:00Z",
+    )
+    life_work = Work(
+        "life-count",
+        "https://archiveofourown.org/works/life-count",
+        title="Life Count",
+        last_scraped_at="2026-01-01T00:00:00Z",
+    )
+    titanic_work = Work(
+        "titanic-count",
+        "https://archiveofourown.org/works/titanic-count",
+        title="Titanic Count",
+        last_scraped_at="2026-01-01T00:00:00Z",
+    )
+    for work in [orphan, life_work, titanic_work]:
+        container.work_repo.upsert(work)
+    container.tag_repo.replace_for_work(life_work.work_id, [WorkTag(life_work.work_id, TagType.FANDOM, life.tag)])
+    container.tag_repo.replace_for_work(titanic_work.work_id, [WorkTag(titanic_work.work_id, TagType.FANDOM, titanic.tag)])
+    container.work_library_service.collect(life_work.work_id, life.fandom_key)
+    container.evaluation_service.save_manual(
+        work_id=life_work.work_id,
+        schema_key=container.schema_service.active_schema().schema_key,
+        scores={"story_fit": 8, "craft": 8, "emotional_pull": 8},
+    )
+    container.evaluation_service.save_manual(
+        work_id=titanic_work.work_id,
+        schema_key=container.schema_service.active_schema().schema_key,
+        scores={"story_fit": 7, "craft": 7, "emotional_pull": 7},
+    )
+    container.queue_service.enqueue(titanic_work.work_id, fandom_key_value=titanic.fandom_key)
+
+    assert container.work_library_service.count() == 1
+    assert container.work_library_service.cache_count() == 3
+    assert container.evaluation_service.count() == 2
+    assert len(container.queue_service.list(QueueStatus.QUEUED)) == 1
+
+    assert container.work_library_service.count_for_fandom(life) == 1
+    assert container.work_library_service.cache_count_for_fandom(life) == 1
+    assert container.evaluation_service.count_for_fandom(life) == 1
+    assert container.queue_service.count_for_fandom(life.fandom_key) == 0
+
+    assert container.work_library_service.count_for_fandom(titanic) == 0
+    assert container.work_library_service.cache_count_for_fandom(titanic) == 1
+    assert container.evaluation_service.count_for_fandom(titanic) == 1
+    assert container.queue_service.count_for_fandom(titanic.fandom_key) == 1
 
 
 def test_rarity_computed_manual_override_and_best_is_manual_only(tmp_path) -> None:

@@ -32,7 +32,9 @@ from app.domain.entities import (
     EvaluationBatch,
     EvaluationQueueItem,
     EvaluationSchema,
+    FandomDirectorySource,
     FandomProfile,
+    FandomSuggestion,
     FandomStyleOverride,
     FavoriteTag,
     ReaderAsset,
@@ -92,6 +94,20 @@ from app.infrastructure.ao3.models import ParsedBrowsePage, ParsedReaderDocument
 
 AO3_BASE_URL = "https://archiveofourown.org"
 DEFAULT_FANDOM = "Life is Strange (Video Games 2015 2017 2024 2026)"
+DEFAULT_FANDOM_DIRECTORY_SOURCES = (
+    ("Movies", "Movies", f"{AO3_BASE_URL}/media/Movies/fandoms", "#f59e0b", True),
+    ("TV Shows", "TV Shows", f"{AO3_BASE_URL}/media/TV%20Shows/fandoms", "#58a6ff", True),
+    ("Video Games", "Video Games", f"{AO3_BASE_URL}/media/Video%20Games/fandoms", "#7ee787", True),
+    ("Anime *a* Manga", "Anime & Manga", f"{AO3_BASE_URL}/media/Anime%20*a*%20Manga/fandoms", "#c084fc", True),
+    ("Books *a* Literature", "Books & Literature", f"{AO3_BASE_URL}/media/Books%20*a*%20Literature/fandoms", "#d6b274", True),
+    (
+        "Cartoons *a* Comics *a* Graphic Novels",
+        "Cartoons & Comics & Graphic Novels",
+        f"{AO3_BASE_URL}/media/Cartoons%20*a*%20Comics%20*a*%20Graphic%20Novels/fandoms",
+        "#fb7185",
+        True,
+    ),
+)
 AO3_SORT_COLUMN_ALIASES = {
     "creator": "authors_to_sort_on",
     "author": "authors_to_sort_on",
@@ -170,6 +186,21 @@ DEFAULT_READER_STYLE = {
         "legendary": "twin",
         "best": "twin",
     },
+}
+STYLE_OVERRIDE_SECTIONS_KEY = "_override_sections"
+STYLE_FONT_KEYS = ("preview_font_family", "reader_font_size", "font_wheel_step_px")
+STYLE_RARITY_KEYS = (
+    "border_thickness",
+    "gradient_border_enabled",
+    "gradient_border_mode",
+    "rarity_map_enabled",
+    "rarity_map",
+)
+DEFAULT_CHARACTER_READER_STYLE = {
+    "font_family": DEFAULT_READER_STYLE["preview_font_family"],
+    "custom_font_enabled": False,
+    "font_size": DEFAULT_READER_STYLE["reader_font_size"],
+    "font_size_enabled": False,
 }
 
 
@@ -333,6 +364,14 @@ def _normalized_rarity_map(value: Any, default_mode: str = "twin") -> dict[str, 
     return rarity_map
 
 
+def normalize_style_override_sections(value: Any, fallback_enabled: bool = False) -> dict[str, bool]:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "font": bool(raw.get("font", fallback_enabled)),
+        "rarity": bool(raw.get("rarity", fallback_enabled)),
+    }
+
+
 def normalize_reader_style(settings: dict[str, Any] | None, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
     base = dict(DEFAULT_READER_STYLE)
     if fallback:
@@ -344,7 +383,7 @@ def normalize_reader_style(settings: dict[str, Any] | None, fallback: dict[str, 
     mode = str(merged.get("gradient_border_mode") or "twin")
     if mode not in GRADIENT_BORDER_MODES:
         mode = "twin"
-    return {
+    normalized = {
         "preview_font_family": str(merged.get("preview_font_family") or DEFAULT_READER_STYLE["preview_font_family"]),
         "reader_font_size": _float_between(merged.get("reader_font_size"), 16.5, 8.0, 48.0),
         "font_wheel_step_px": _float_between(merged.get("font_wheel_step_px"), 0.5, 0.5, 10.0),
@@ -353,6 +392,30 @@ def normalize_reader_style(settings: dict[str, Any] | None, fallback: dict[str, 
         "gradient_border_mode": mode,
         "rarity_map_enabled": bool(merged.get("rarity_map_enabled")),
         "rarity_map": _normalized_rarity_map(merged.get("rarity_map"), mode),
+    }
+    if isinstance(raw.get(STYLE_OVERRIDE_SECTIONS_KEY), dict):
+        normalized[STYLE_OVERRIDE_SECTIONS_KEY] = normalize_style_override_sections(raw.get(STYLE_OVERRIDE_SECTIONS_KEY))
+    return normalized
+
+
+def normalize_character_reader_style(settings: dict[str, Any] | None, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = dict(DEFAULT_CHARACTER_READER_STYLE)
+    if fallback:
+        base.update(
+            {
+                "font_family": str(fallback.get("font_family") or fallback.get("preview_font_family") or base["font_family"]),
+                "font_size": _float_between(fallback.get("font_size") or fallback.get("reader_font_size"), base["font_size"], 8.0, 48.0),
+                "custom_font_enabled": bool(fallback.get("custom_font_enabled", base["custom_font_enabled"])),
+                "font_size_enabled": bool(fallback.get("font_size_enabled", base["font_size_enabled"])),
+            }
+        )
+    raw = dict(settings or {})
+    font_family = str(raw.get("font_family") or raw.get("preview_font_family") or base["font_family"])
+    return {
+        "font_family": font_family,
+        "custom_font_enabled": bool(raw.get("custom_font_enabled", raw.get("font_enabled", base["custom_font_enabled"]))),
+        "font_size": _float_between(raw.get("font_size") or raw.get("reader_font_size"), float(base["font_size"]), 8.0, 48.0),
+        "font_size_enabled": bool(raw.get("font_size_enabled", base["font_size_enabled"])),
     }
 
 
@@ -521,6 +584,180 @@ class FandomService:
             self.settings.set("active_fandom_key", profile.fandom_key)
         return profile
 
+    def suggest_fandoms(self, query: str, limit: int = 12) -> list[FandomSuggestion]:
+        clean_query = " ".join(str(query or "").split())
+        if not clean_query:
+            return []
+        self.ensure_fandom_directory_sources()
+        return self.fandoms.suggest_directory_fandoms(clean_query, limit)
+
+    def ensure_fandom_directory_sources(self) -> list[FandomDirectorySource]:
+        existing = {source.media_key: source for source in self.fandoms.list_directory_sources()}
+        for media_key, label, url, color, enabled in DEFAULT_FANDOM_DIRECTORY_SOURCES:
+            if media_key in existing:
+                continue
+            source = FandomDirectorySource(
+                media_key=media_key,
+                label=label,
+                url=url,
+                color=color,
+                enabled=enabled,
+            )
+            self.fandoms.upsert_directory_source(source)
+        return self.fandoms.list_directory_sources()
+
+    def refresh_fandom_directory_sources(self) -> ServiceResult:
+        self.ensure_fandom_directory_sources()
+        if not hasattr(self.ao3_client, "fetch_media_categories"):
+            return ServiceResult(False, "AO3 media categories are not available.")
+        try:
+            remote_sources = list(self.ao3_client.fetch_media_categories())
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(False, f"AO3 media categories failed: {exc}")
+        current = {source.media_key: source for source in self.fandoms.list_directory_sources()}
+        default_by_key = {
+            media_key: FandomDirectorySource(media_key, label, url, color, enabled)
+            for media_key, label, url, color, enabled in DEFAULT_FANDOM_DIRECTORY_SOURCES
+        }
+        added = 0
+        for remote in remote_sources:
+            existing = current.get(remote.media_key)
+            fallback = default_by_key.get(remote.media_key)
+            source = FandomDirectorySource(
+                media_key=remote.media_key,
+                label=fallback.label if fallback else remote.label,
+                url=remote.url,
+                color=(existing.color if existing else fallback.color if fallback else remote.color or "#58a6ff"),
+                enabled=bool(existing.enabled if existing else fallback.enabled if fallback else False),
+                cached_at=existing.cached_at if existing else None,
+            )
+            if not existing:
+                added += 1
+            self.fandoms.upsert_directory_source(source)
+        sources = self.fandoms.list_directory_sources()
+        return ServiceResult(True, f"Found {len(sources)} AO3 fandom categories.", payload=sources, )
+
+    def update_fandom_directory_source(
+        self,
+        media_key: str,
+        *,
+        enabled: bool | None = None,
+        color: str | None = None,
+    ) -> ServiceResult:
+        sources = {source.media_key: source for source in self.ensure_fandom_directory_sources()}
+        source = sources.get(str(media_key or ""))
+        if not source:
+            return ServiceResult(False, "Fandom category not found.")
+        clean_color = source.color
+        if color is not None:
+            clean_color = self._normalize_hex_color(color)
+            if color and not clean_color:
+                return ServiceResult(False, "Fandom category color must be a hex color.")
+            clean_color = clean_color or source.color or "#58a6ff"
+        updated = FandomDirectorySource(
+            media_key=source.media_key,
+            label=source.label,
+            url=source.url,
+            color=clean_color,
+            enabled=source.enabled if enabled is None else bool(enabled),
+            cached_at=source.cached_at,
+            updated_at=source.updated_at,
+            cached_count=source.cached_count,
+        )
+        self.fandoms.upsert_directory_source(updated)
+        return ServiceResult(True, "Fandom category updated.", payload=updated)
+
+    def cache_fandom_directory_sources(self, media_keys: list[str] | None = None) -> ServiceResult:
+        sources = self.ensure_fandom_directory_sources()
+        wanted = {str(key) for key in media_keys or [] if str(key).strip()}
+        selected = [source for source in sources if source.media_key in wanted] if wanted else [source for source in sources if source.enabled]
+        if not selected:
+            return ServiceResult(False, "Select at least one fandom category to cache.")
+        if not hasattr(self.ao3_client, "fetch_media_fandoms"):
+            return ServiceResult(False, "AO3 media fandom fetch is not available.")
+        added = 0
+        total = 0
+        failed: list[str] = []
+        for source in selected:
+            try:
+                suggestions = list(
+                    self.ao3_client.fetch_media_fandoms(source.media_key, source.label, source.url, source.color or "#58a6ff")
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"{source.label}: {exc}")
+                continue
+            self.fandoms.upsert_directory_source(source)
+            added += self.fandoms.cache_directory_fandoms(source.media_key, suggestions)
+            total += len(suggestions)
+        if failed:
+            message = f"Cached {total:,} fandom tags; {added:,} new. Failed: {'; '.join(failed[:2])}"
+            return ServiceResult(False, message, payload={"added": added, "total": total, "failed": failed})
+        return ServiceResult(True, f"Cached {total:,} fandom tags; {added:,} new.", payload={"added": added, "total": total})
+
+    def delete_fandom_directory_cache(self, media_key: str) -> ServiceResult:
+        sources = {source.media_key: source for source in self.ensure_fandom_directory_sources()}
+        source = sources.get(str(media_key or ""))
+        if not source:
+            return ServiceResult(False, "Fandom category not found.")
+        deleted = self.fandoms.delete_directory_cache(source.media_key)
+        return ServiceResult(True, f"Deleted {deleted:,} cached {source.label} fandom tags.", payload={"deleted": deleted})
+
+    def create_from_suggestion(self, suggestion: FandomSuggestion) -> FandomProfile:
+        tag = str(suggestion.tag or suggestion.label or "").strip()
+        if not tag:
+            raise ValueError("Fandom tag is required.")
+        existing = self.fandoms.get_by_tag(tag)
+        if existing:
+            self.select(existing.fandom_key)
+            return existing
+        now = utc_now_iso()
+        profile = FandomProfile(
+            fandom_key=fandom_key(tag),
+            tag=tag,
+            display_name=short_fandom_name(str(suggestion.label or tag)),
+            color="#58a6ff",
+            default_filter=default_fandom_filter(tag),
+            created_at=now,
+            updated_at=now,
+            selected_at=now,
+        )
+        self.fandoms.save(profile)
+        self.select(profile.fandom_key)
+        return profile
+
+    @staticmethod
+    def _normalize_hex_color(value: str | None) -> str:
+        clean = str(value or "").strip()
+        if re.fullmatch(r"#?[0-9a-fA-F]{6}", clean):
+            return f"#{clean.lstrip('#').lower()}"
+        if re.fullmatch(r"#?[0-9a-fA-F]{3}", clean):
+            raw = clean.lstrip("#").lower()
+            return "#" + "".join(char * 2 for char in raw)
+        return ""
+
+    def export_fandom_backup(self, fandom_key: str) -> tuple[str, bytes]:
+        return self.fandoms.export_backup_zip(fandom_key)
+
+    def import_fandom_backup(self, zip_bytes: bytes) -> FandomProfile:
+        profile = self.fandoms.import_backup_zip(zip_bytes)
+        self.select(profile.fandom_key)
+        return profile
+
+    def delete_fandoms_after_backup(self, fandom_keys: list[str]) -> ServiceResult:
+        selected = [key for key in dict.fromkeys(str(item) for item in fandom_keys) if key.strip()]
+        if not selected:
+            return ServiceResult(False, "Select one or more fandoms first.")
+        deleted = self.fandoms.delete_clean(selected)
+        active_key = str(self.settings.get("active_fandom_key", "") or "")
+        if active_key in selected or not self.active_profile():
+            profiles = self.fandoms.list()
+            if profiles:
+                self.select(profiles[0].fandom_key)
+            else:
+                self.settings.set("active_fandom_key", "")
+                self.ensure_default()
+        return ServiceResult(True, f"Deleted {deleted} fandom{'s' if deleted != 1 else ''}.")
+
     def save_filter_preferences(self, fandom_key: str, filter_state: dict[str, Any]) -> ServiceResult:
         profile = self.fandoms.get(fandom_key)
         if not profile:
@@ -543,6 +780,7 @@ class FandomService:
         avatar_url: str = "",
         tag_urls: list[str] | None = None,
         notes: str = "",
+        reader_style: dict[str, Any] | None = None,
         character_id: str | None = None,
     ) -> ServiceResult:
         if not name.strip():
@@ -558,6 +796,7 @@ class FandomService:
                 avatar_url=avatar_url.strip() or None,
                 tag_urls=[url.strip() for url in (tag_urls or []) if url.strip()],
                 notes=notes.strip() or None,
+                reader_style=normalize_character_reader_style(reader_style),
                 created_at=now,
                 updated_at=now,
             )
@@ -608,23 +847,39 @@ class StyleService:
         self.settings.set(STYLE_SETTINGS_KEY, normalized)
         return normalized
 
+    def override_sections(self, override: FandomStyleOverride | None) -> dict[str, bool]:
+        if not override:
+            return normalize_style_override_sections(None, False)
+        return normalize_style_override_sections(
+            (override.settings or {}).get(STYLE_OVERRIDE_SECTIONS_KEY),
+            bool(override.enabled),
+        )
+
     def fandom_override(self, fandom_key: str) -> FandomStyleOverride:
         existing = self.fandom_styles.get(fandom_key)
         if existing:
             existing.settings = normalize_reader_style(existing.settings, self.global_settings())
+            existing.settings[STYLE_OVERRIDE_SECTIONS_KEY] = self.override_sections(existing)
+            existing.enabled = any(existing.settings[STYLE_OVERRIDE_SECTIONS_KEY].values())
             return existing
         return FandomStyleOverride(
             fandom_key=fandom_key,
             enabled=False,
-            settings=self.global_settings(),
+            settings={
+                **self.global_settings(),
+                STYLE_OVERRIDE_SECTIONS_KEY: normalize_style_override_sections(None, False),
+            },
             updated_at=utc_now_iso(),
         )
 
     def save_fandom_override(self, fandom_key: str, enabled: bool, settings: dict[str, Any]) -> FandomStyleOverride:
+        sections = normalize_style_override_sections(settings.get(STYLE_OVERRIDE_SECTIONS_KEY), enabled)
+        normalized = normalize_reader_style(settings, self.global_settings())
+        normalized[STYLE_OVERRIDE_SECTIONS_KEY] = sections
         override = FandomStyleOverride(
             fandom_key=fandom_key,
-            enabled=enabled,
-            settings=normalize_reader_style(settings, self.global_settings()),
+            enabled=any(sections.values()),
+            settings=normalized,
             updated_at=utc_now_iso(),
         )
         self.fandom_styles.save(override)
@@ -635,9 +890,18 @@ class StyleService:
         if not fandom_key:
             return global_settings
         override = self.fandom_styles.get(fandom_key)
-        if not override or not override.enabled:
+        sections = self.override_sections(override)
+        if not override or not any(sections.values()):
             return global_settings
-        return normalize_reader_style(override.settings, global_settings)
+        override_settings = normalize_reader_style(override.settings, global_settings)
+        effective = dict(global_settings)
+        if sections.get("font"):
+            for key in STYLE_FONT_KEYS:
+                effective[key] = override_settings[key]
+        if sections.get("rarity"):
+            for key in STYLE_RARITY_KEYS:
+                effective[key] = override_settings[key]
+        return normalize_reader_style(effective)
 
     def rarity_thresholds(self) -> dict[str, float]:
         return normalize_rarity_thresholds(self.settings.get(RARITY_THRESHOLDS_KEY, DEFAULT_RARITY_THRESHOLDS))
@@ -654,8 +918,18 @@ class StyleService:
         effective["reader_font_size"] = _float_between(next_size, 16.5, 8.0, 48.0)
         if fandom_key:
             override = self.fandom_styles.get(fandom_key)
-            if override and override.enabled:
-                self.save_fandom_override(fandom_key, True, effective)
+            sections = self.override_sections(override)
+            if override and sections.get("font"):
+                saved = dict(override.settings or {})
+                saved.update(
+                    {
+                        "preview_font_family": effective["preview_font_family"],
+                        "reader_font_size": effective["reader_font_size"],
+                        "font_wheel_step_px": effective["font_wheel_step_px"],
+                        STYLE_OVERRIDE_SECTIONS_KEY: sections,
+                    }
+                )
+                self.save_fandom_override(fandom_key, any(sections.values()), saved)
                 return effective
         self.save_global_settings(effective)
         return effective
@@ -997,6 +1271,10 @@ class EvaluationService:
     def count(self) -> int:
         return self.evaluations.count()
 
+    def count_for_fandom(self, profile: FandomProfile) -> int:
+        identity = self.identities.get_or_create_local()
+        return self.evaluations.count_for_fandom(identity.local_user_id, profile.fandom_key, profile.tag)
+
 
 @dataclass(slots=True)
 class EvaluationBatchSummary:
@@ -1066,6 +1344,14 @@ class EvaluationBatchWorks:
     tags_by_work: dict[str, list[WorkTag]]
     latest_evaluations: dict[str, Evaluation]
     summary: EvaluationBatchSummary | None = None
+
+
+@dataclass(slots=True)
+class QueueClusterTarget:
+    work_set_id: str
+    name: str
+    active_count: int
+    completed_count: int
 
 
 @dataclass(slots=True)
@@ -1161,6 +1447,20 @@ class EvaluationQueueService:
 
     def list(self, status: QueueStatus | None = None, batch_id: str | None = None) -> list[EvaluationQueueItem]:
         return self.queue.list(status=status, batch_id=batch_id)
+
+    def count_for_fandom(self, fandom_key: str, status: QueueStatus | None = QueueStatus.QUEUED) -> int:
+        count = 0
+        batch_cache: dict[str, EvaluationBatch | None] = {}
+        for item in self.queue.list(status=status):
+            batch_id = str(item.batch_id or "")
+            if not batch_id:
+                continue
+            if batch_id not in batch_cache:
+                batch_cache[batch_id] = self.batches.get(batch_id)
+            batch = batch_cache[batch_id]
+            if batch and batch.fandom_key == fandom_key:
+                count += 1
+        return count
 
     def active_item_for_work(
         self,
@@ -1305,6 +1605,85 @@ class EvaluationQueueService:
 
     def evaluated_works_for_batch(self, batch_id: str) -> EvaluationBatchWorks | None:
         return self._works_for_batch(batch_id, completed=True)
+
+    def cluster_targets(self, fandom_key: str) -> list[QueueClusterTarget]:
+        return [
+            QueueClusterTarget(
+                work_set_id=cluster.work_set.id,
+                name=cluster.work_set.name,
+                active_count=cluster.active_count,
+                completed_count=cluster.completed_count,
+            )
+            for cluster in self._cluster_summaries(fandom_key)
+        ]
+
+    def queue_work_to_named_cluster(
+        self,
+        *,
+        fandom_key: str,
+        cluster_name: str,
+        work_id: str,
+        schema_key: str | None = None,
+    ) -> ServiceResult:
+        clean_name = re.sub(r"\s+", " ", str(cluster_name or "").strip())
+        if not clean_name:
+            return ServiceResult(False, "Queue needs a name.")
+        clean_work_id = str(work_id or "").strip()
+        if not clean_work_id:
+            return ServiceResult(False, "Work was not found.")
+        if not self.works.get(clean_work_id):
+            return ServiceResult(False, "Work was not found.")
+        schema = self._schema(schema_key)
+        work_set = self.work_sets.get_by_name(fandom_key, clean_name)
+        if not work_set:
+            now = utc_now_iso()
+            work_set = WorkSet(
+                id=str(uuid.uuid4()),
+                fandom_key=fandom_key,
+                name=clean_name,
+                filter_state={"queue": "manual_named"},
+                filter_signature=f"manual_named:{clean_name.casefold()}",
+                created_at=now,
+                updated_at=now,
+            )
+            self.work_sets.save(work_set)
+        self.work_sets.add_items(work_set.id, [clean_work_id])
+        batch = self.batches.get_by_work_set_schema(work_set.id, schema.schema_key)
+        if batch and batch.status is EvaluationBatchStatus.ARCHIVED:
+            batch.status = EvaluationBatchStatus.QUEUED
+            batch.completed_at = None
+            batch.updated_at = utc_now_iso()
+            self.batches.save(batch)
+        batch = batch or self._ensure_batch(work_set, schema.schema_key)
+        completed_ids = self._completed_ids_for_batch(batch)
+        queued = 0
+        already_in_queue = False
+        if clean_work_id not in completed_ids:
+            queue_statuses = {QueueStatus.QUEUED, QueueStatus.RUNNING, QueueStatus.FAILED, QueueStatus.SKIPPED}
+            already_in_queue = any(
+                row.work_id == clean_work_id
+                and row.queue_status in queue_statuses
+                and row.schema_key in {None, "", batch.schema_key}
+                for row in self.queue.list(batch_id=batch.id)
+            )
+            if not already_in_queue:
+                self.enqueue(
+                    clean_work_id,
+                    reason=f"Manual queue: {work_set.name}",
+                    priority=100,
+                    batch_id=batch.id,
+                    schema_key=batch.schema_key,
+                    fandom_key_value=fandom_key,
+                )
+                queued = 1
+        self._sync_batch_status(batch)
+        if queued:
+            message = f"Queued {clean_work_id} in {work_set.name}."
+        elif already_in_queue:
+            message = f"{clean_work_id} is already in {work_set.name}."
+        else:
+            message = f"Added {clean_work_id} to {work_set.name}; already evaluated for {schema.name}."
+        return ServiceResult(True, message, payload={"work_set": work_set, "batch": batch, "queued": queued})
 
     def work_ids_for_batch(self, batch_id: str) -> list[str]:
         batch = self.batches.get(batch_id)
@@ -1492,6 +1871,7 @@ class EvaluationQueueService:
         self,
         work_set_id: str,
         *,
+        name: str | None = None,
         color: str | None = None,
         favorite: bool | None = None,
         description: str | None = None,
@@ -1499,6 +1879,14 @@ class EvaluationQueueService:
         work_set = self.work_sets.get(work_set_id)
         if not work_set:
             return ServiceResult(False, "Queue cluster was not found.")
+        if name is not None:
+            clean_name = re.sub(r"\s+", " ", str(name or "").strip())
+            if not clean_name:
+                return ServiceResult(False, "Queue name cannot be blank.")
+            duplicate = self.work_sets.get_by_name(work_set.fandom_key, clean_name)
+            if duplicate and duplicate.id != work_set.id:
+                return ServiceResult(False, f"A queue named {clean_name} already exists.")
+            work_set.name = clean_name
         state = dict(work_set.filter_state or {})
         meta = dict(state.get("_cluster_meta") if isinstance(state.get("_cluster_meta"), dict) else {})
         if color is not None:
@@ -1776,16 +2164,13 @@ class EvaluationQueueService:
         failed = sum(1 for row in rows if row.queue_status is QueueStatus.FAILED and row.work_id not in completed_ids)
         skipped = sum(1 for row in rows if row.queue_status is QueueStatus.SKIPPED and row.work_id not in completed_ids)
         queued_rows = sum(1 for row in rows if row.queue_status is QueueStatus.QUEUED and row.work_id not in completed_ids)
-        pending_missing_rows = 0
-        if batch.status is not EvaluationBatchStatus.ARCHIVED:
-            pending_missing_rows = max(0, len([work_id for work_id in work_ids if work_id not in completed_ids]) - running - failed - skipped - queued_rows)
         self._sync_batch_status_from_counts(batch, len(work_ids), len(completed_ids))
         return EvaluationBatchSummary(
             batch=batch,
             work_set=work_set,
             schema=self.schemas.get(batch.schema_key),
             total_count=len(work_ids),
-            pending_count=queued_rows + pending_missing_rows,
+            pending_count=queued_rows,
             running_count=running,
             failed_count=failed,
             skipped_count=skipped,
@@ -1826,11 +2211,23 @@ class EvaluationQueueService:
         latest = self.evaluations.latest_for_works(work_ids, identity.local_user_id, batch.schema_key)
         rows = self.queue.list(batch_id=batch.id)
         summary = self._batch_summary_from_data(batch, work_set, work_ids, latest, rows)
-        selected_ids = [
-            work_id
-            for work_id in work_ids
-            if (latest.get(work_id) is not None and latest[work_id].status is EvaluationStatus.COMPLETE) == completed
-        ]
+        if completed:
+            selected_ids = [
+                work_id
+                for work_id in work_ids
+                if latest.get(work_id) is not None and latest[work_id].status is EvaluationStatus.COMPLETE
+            ]
+        else:
+            active_statuses = {QueueStatus.QUEUED, QueueStatus.RUNNING, QueueStatus.FAILED, QueueStatus.SKIPPED}
+            selected_ids = list(
+                dict.fromkeys(
+                    row.work_id
+                    for row in rows
+                    if row.queue_status in active_statuses
+                    and row.work_id in work_ids
+                    and not (latest.get(row.work_id) and latest[row.work_id].status is EvaluationStatus.COMPLETE)
+                )
+            )
         works_by_id = {work.work_id: work for work in self.works.list_by_ids(selected_ids)}
         visible_works = [works_by_id[work_id] for work_id in selected_ids if work_id in works_by_id]
         return EvaluationBatchWorks(
@@ -1992,6 +2389,12 @@ class WorkLibraryService:
 
     def cache_count(self) -> int:
         return self.works.count()
+
+    def count_for_fandom(self, profile: FandomProfile) -> int:
+        return self.collection.count(profile.fandom_key)
+
+    def cache_count_for_fandom(self, profile: FandomProfile) -> int:
+        return self.works.count_for_fandom(profile.fandom_key, profile.tag)
 
     def collect(self, work_id: str, fandom_key: str | None = None, note: str = "") -> ServiceResult:
         if not self.works.get(work_id):
@@ -3113,9 +3516,15 @@ class QueueEvaluationRunnerService:
         if not work_set:
             return ServiceResult(False, "Queue cluster is unavailable.")
         identity = self.identities.get_or_create_local()
-        ordered_work_ids = self._ordered_work_ids(self.work_sets.list_work_ids(work_set.id), work_order)
+        active_statuses = {QueueStatus.QUEUED, QueueStatus.RUNNING, QueueStatus.FAILED, QueueStatus.SKIPPED}
+        active_rows = [
+            row
+            for row in self.queue.list(batch_id=batch.id)
+            if row.queue_status in active_statuses
+        ]
+        rows = {row.work_id: row for row in active_rows}
+        ordered_work_ids = self._ordered_work_ids([row.work_id for row in active_rows], work_order)
         latest = self.evaluations.latest_for_works(ordered_work_ids, identity.local_user_id, batch.schema_key)
-        rows = {row.work_id: row for row in self.queue.list(batch_id=batch.id)}
         candidates = [
             work_id
             for work_id in ordered_work_ids
@@ -3140,14 +3549,7 @@ class QueueEvaluationRunnerService:
                     break
                 row = rows.get(work_id)
                 if not row:
-                    row = self.queue_service.enqueue(
-                        work_id,
-                        reason=f"Queue run: {work_set.name}",
-                        batch_id=batch.id,
-                        schema_key=batch.schema_key,
-                        fandom_key_value=batch.fandom_key,
-                    )
-                    rows[work_id] = row
+                    continue
                 self.queue.update_status(row.id, QueueStatus.RUNNING)
                 sample = self.sample_work(work_id, config)
                 if not sample.ok or not isinstance(sample.payload, WorkEvaluationSample):

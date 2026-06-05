@@ -17,8 +17,11 @@ from app.application.composition import ApplicationContainer
 from app.application.dto import ServiceResult
 from app.application.services import (
     DEFAULT_FANDOM,
+    DEFAULT_READER_STYLE,
+    STYLE_OVERRIDE_SECTIONS_KEY,
     default_fandom_filter,
     fandom_key,
+    normalize_character_reader_style,
     normalize_ao3_date_filter,
     normalize_ao3_sort_column,
     normalize_word_count_filter,
@@ -283,11 +286,18 @@ class AO3StudioShell:
         self.top_container = None
         self.left_container = None
         self.left_footer_container = None
+        self.fandoms_container = None
+        self.fandom_row_refs: dict[str, dict[str, Any]] = {}
         self.center_container = None
         self.right_header_container = None
         self.right_container = None
         self.filter_metadata: Any | None = container.preferences_service.get("last_filter_metadata", None)
-        self.left_fandom_split = int(container.preferences_service.get("left_fandom_split", 44) or 44)
+        raw_left_summary_split = int(container.preferences_service.get("left_summary_split", 0) or 0)
+        self.left_summary_split = 0 if raw_left_summary_split <= 4 else raw_left_summary_split
+        self.left_fandom_search_text = str(container.preferences_service.get("left_fandom_search", "") or "")
+        self.fandom_cleanup_mode = False
+        self.fandom_cleanup_selected: set[str] = set()
+        self.fandom_cleanup_delete_armed = False
         self.block_armed_work_id = ""
         self.work_remove_armed_id = ""
         self.queue_cleanup_mode = False
@@ -396,6 +406,9 @@ class AO3StudioShell:
         if not step:
             return
         active = self._active_fandom()
+        if self._adjust_selected_character_font_size(active, step):
+            self._render_center()
+            return
         self.container.style_service.adjust_font_size(active.fandom_key, step)
         self._render_center()
 
@@ -451,11 +464,27 @@ class AO3StudioShell:
             return
         self.page = page
         self.container.preferences_service.set("active_page", page)
+        self._persist_fandom_page(page)
         self._render_center()
         self._render_top()
         self._render_right_header()
         self._render_right()
         self._render_left_footer()
+
+    def _fandom_page_key(self, fandom_key_value: str | None = None) -> str:
+        active = self.container.fandom_service.active_profile()
+        key = fandom_key_value or (active.fandom_key if active else self.container.fandom_service.ensure_default().fandom_key)
+        return f"active_page:{key}"
+
+    def _persist_fandom_page(self, page: str | None = None) -> None:
+        active = self.container.fandom_service.active_profile()
+        if not active:
+            return
+        self.container.preferences_service.set(self._fandom_page_key(active.fandom_key), page or self.page)
+
+    def _restore_fandom_page(self, fandom_key_value: str) -> str:
+        page = str(self.container.preferences_service.get(self._fandom_page_key(fandom_key_value), "") or "")
+        return page if page in {label for label, _icon in WORKSPACE_TABS} else "Browse"
 
     def _select_work(self, work_id: str, page: str | None = None) -> None:
         if page:
@@ -864,11 +893,15 @@ class AO3StudioShell:
             return
         self.left_container.clear()
         with self.left_container:
-            with ui.column().classes("w-full flex-grow min-h-0 gap-2"):
-                info_height = max(16, min(58, self.left_fandom_split))
-                with ui.column().classes("w-full min-h-0 gap-2 pb-2 overflow-hidden").style(
-                    f"height: {info_height}%; min-height: 110px;"
-                ):
+            body = ui.column().classes("w-full flex-grow min-h-0 gap-2")
+            body.on("click", lambda _=None: self._disarm_fandom_cleanup_delete())
+            with body:
+                summary_split = max(0, min(58, self.left_summary_split))
+                summary_style = f"height: {summary_split}%;" if summary_split else ""
+                summary_classes = "w-full min-h-0 gap-2 overflow-hidden"
+                if not summary_split:
+                    summary_classes += " shrink-0"
+                with ui.column().classes(summary_classes).style(summary_style):
                     self._left_data_panel()
                 split_handle = ui.element("div").classes("w-full h-3 shrink-0 cursor-row-resize flex items-center group")
                 split_handle.style("touch-action: none;")
@@ -876,28 +909,33 @@ class AO3StudioShell:
                     ui.element("div").classes("w-full h-px bg-gray-700 group-hover:bg-cyan-500 transition-colors")
                 split_handle.on(
                     "mousedown",
-                    self._save_fandom_split,
+                    self._save_left_summary_split,
                     js_handler="""
                         e => {
                             e.preventDefault();
                             const handle = e.currentTarget;
                             const parent = handle.parentElement;
                             const top = handle.previousElementSibling;
-                            const min = 16;
                             const max = 58;
-                            const clamp = value => Math.max(min, Math.min(max, value));
-                            const percentFromEvent = ev => {
-                                const rect = parent.getBoundingClientRect();
-                                return clamp(((ev.clientY - rect.top) / rect.height) * 100);
+                            const clamp = value => Math.max(0, Math.min(max, value));
+                            const parentRect = parent.getBoundingClientRect();
+                            const startY = e.clientY;
+                            const startHeight = top.getBoundingClientRect().height;
+                            const compactHeight = top.scrollHeight;
+                            const splitFromEvent = ev => {
+                                const height = startHeight + ev.clientY - startY;
+                                if (height <= compactHeight + 2) return 0;
+                                return clamp((height / parentRect.height) * 100);
                             };
-                            const move = ev => { top.style.height = percentFromEvent(ev) + '%'; };
+                            const applySplit = split => { top.style.height = split <= 0 ? '' : split + '%'; };
+                            const move = ev => { applySplit(splitFromEvent(ev)); };
                             const up = ev => {
                                 document.removeEventListener('mousemove', move);
                                 document.removeEventListener('mouseup', up);
                                 document.body.style.cursor = '';
                                 document.body.style.userSelect = '';
-                                const percent = Math.round(percentFromEvent(ev));
-                                top.style.height = percent + '%';
+                                const percent = Math.round(splitFromEvent(ev));
+                                applySplit(percent);
                                 emit(percent);
                             };
                             document.body.style.cursor = 'row-resize';
@@ -911,58 +949,61 @@ class AO3StudioShell:
             self.left_footer_container = ui.element("div").classes("w-full shrink-0")
             self._render_left_footer()
 
-    def _save_fandom_split(self, event) -> None:
+    def _save_left_summary_split(self, event) -> None:
         try:
             percent = int(round(float(event.args)))
         except (TypeError, ValueError):
             return
-        self.left_fandom_split = max(16, min(58, percent))
-        self.container.preferences_service.set("left_fandom_split", self.left_fandom_split)
+        self.left_summary_split = max(0, min(58, percent))
+        self.container.preferences_service.set("left_summary_split", self.left_summary_split)
 
     def _left_data_panel(self) -> None:
-        identity = self.container.identity_service.bootstrap()
+        active = self.container.fandom_service.ensure_default()
         schema = self.container.schema_service.active_schema()
         model = self.container.local_model_service.config().get("model") or "not selected"
-        browse_state = self._browse_filter_state()
-        with ui.element("div").classes("soft-panel w-full p-3"):
-            ui.label("Local Data").classes("text-sm font-bold")
-            ui.label(identity.display_name or identity.local_user_id[:8]).classes("text-xs text-gray-400 truncate")
-            with ui.row().classes("w-full items-center justify-between mt-2"):
-                ui.label("Works kept").classes("text-xs text-gray-500")
-                ui.label(str(self.container.work_library_service.count())).classes("text-xs font-bold")
-            with ui.row().classes("w-full items-center justify-between"):
-                ui.label("Browse cache").classes("text-xs text-gray-500")
-                ui.label(str(self.container.work_library_service.cache_count())).classes("text-xs font-bold")
-            with ui.row().classes("w-full items-center justify-between"):
-                ui.label("Evaluations").classes("text-xs text-gray-500")
-                ui.label(str(self.container.evaluation_service.count())).classes("text-xs font-bold")
-            with ui.row().classes("w-full items-center justify-between"):
-                ui.label("Queued").classes("text-xs text-gray-500")
-                ui.label(str(len(self.container.queue_service.list(QueueStatus.QUEUED)))).classes("text-xs font-bold")
-            ui.separator().classes("my-2")
-            ui.label(f"Fandom: {browse_state['fandom']}").classes("text-xs text-gray-400 truncate")
-            ui.label(schema.name).classes("text-xs text-gray-400 truncate")
+        metrics = [
+            ("Works", self.container.work_library_service.count_for_fandom(active), "#f59e0b"),
+            ("Cache", self.container.work_library_service.cache_count_for_fandom(active), RARITY_COLORS[RarityTier.COMMON]),
+            ("Eval", self.container.evaluation_service.count_for_fandom(active), RARITY_COLORS[RarityTier.EPIC]),
+            ("Queue", self.container.queue_service.count_for_fandom(active.fandom_key), RARITY_COLORS[RarityTier.RARE]),
+        ]
+        with ui.element("div").classes("soft-panel w-full px-2 py-2"):
+            with ui.row().classes("w-full items-center gap-1.5 no-wrap overflow-hidden"):
+                for index, (label, value, color) in enumerate(metrics):
+                    if index:
+                        ui.label("|").classes("text-xs shrink-0").style("color: #4b5563;")
+                    with ui.row().classes("items-baseline gap-1 no-wrap shrink-0"):
+                        ui.label(f"{label}:").classes("text-xs text-gray-500 shrink-0")
+                        ui.label(str(value)).classes("text-xs shrink-0").style(f"color: {color};")
+            ui.label(schema.name).classes("text-xs text-gray-400 truncate mt-1")
             ui.label(f"LM: {model}").classes("text-xs text-gray-500 truncate")
-        snapshots = self.container.browse_service.recent_snapshots()
-        if snapshots:
-            with ui.element("div").classes("soft-panel w-full p-3"):
-                ui.label("Recent").classes("text-sm font-bold")
-                for snapshot in snapshots[:5]:
-                    ui.label(f"{snapshot.context_key} ({len(snapshot.work_ids)})").classes("text-xs text-gray-500 truncate")
 
     def _render_left_footer(self) -> None:
         if not self.left_footer_container:
             return
         active = self.container.fandom_service.ensure_default()
         self.left_footer_container.clear()
-        with self.left_footer_container, ui.row().classes("w-full items-center justify-between mt-auto pt-2 border-t border-gray-700"):
+        with self.left_footer_container, ui.row().classes("w-full items-center justify-between mt-auto pt-2 border-t border-gray-700").on(
+            "click",
+            lambda _=None: self._disarm_fandom_cleanup_delete(),
+        ):
             with ui.row().classes("items-center gap-1 min-w-0"):
-                refresh = ui.button(icon="refresh").props("flat round dense size=sm")
-                refresh.style(f"color: {normalized_label_color(active.color)} !important; opacity: 0.82;")
-                refresh.on("click.stop", lambda _=None: self._set_page("Browse"))
-                with refresh:
-                    rich_tooltip("Return to active fandom browse", active.color)
-                ui.label(short_fandom_name(active.tag)).classes("text-xs text-gray-500 truncate")
+                cleanup = ui.button(icon="cleaning_services").props("flat round dense size=sm")
+                cleanup.style(f"color: {'#f8fafc' if self.fandom_cleanup_mode else '#6b7280'} !important; opacity: 0.88;")
+                cleanup.on("click.stop", lambda _=None: self._toggle_fandom_cleanup())
+                with cleanup:
+                    rich_tooltip("Cleanup mode: select fandoms to delete.", active.color)
+                if self.fandom_cleanup_mode:
+                    trash_color = "#ef4444" if self.fandom_cleanup_delete_armed else "#6b7280"
+                    trash = ui.button(icon="delete").props("flat round dense size=sm")
+                    trash.style(f"color: {trash_color} !important; opacity: 0.90;")
+                    trash.on("click.stop", lambda _=None: self._handle_fandom_cleanup_delete())
+                    with trash:
+                        rich_tooltip(
+                            "Open backup-required delete" if self.fandom_cleanup_delete_armed else "Arm fandom deletion",
+                            "#ef4444" if self.fandom_cleanup_delete_armed else active.color,
+                        )
+                    ui.label(f"{len(self.fandom_cleanup_selected)} selected").classes("text-xs text-gray-500")
             with ui.row().classes("items-center gap-1"):
                 if self.page == "Queue":
                     queue_config = ui.button(icon="psychology").props("flat round dense size=sm")
@@ -988,62 +1029,572 @@ class AO3StudioShell:
 
     def _render_fandom_list(self) -> None:
         active = self.container.fandom_service.ensure_default()
-        profiles = self.container.fandom_service.list_profiles()
         with ui.column().classes("w-full flex-grow min-h-0 gap-2 pt-1"):
-            with ui.row().classes("w-full items-center justify-between gap-1"):
-                ui.label("Fandoms").classes("text-sm font-bold text-gray-200")
+            with ui.row().classes("w-full items-center gap-1"):
+                search = ui.input("Search fandoms", value=self.left_fandom_search_text).props("dark outlined dense clearable").classes(
+                    "flex-grow min-w-0"
+                )
+                search.on("update:model-value", self._handle_fandom_search)
                 add_btn = ui.button(icon="add").props("flat round dense color=cyan")
-                add_btn.on("click.stop", lambda _=None: self._show_fandom_dialog(None))
+                add_btn.on("click.stop", lambda _=None: self._show_create_fandom_dialog())
                 with add_btn:
                     rich_tooltip("Create fandom", active.color)
-            with ui.scroll_area().classes("w-full flex-grow min-h-0"):
-                with ui.column().classes("w-full gap-1"):
-                    for profile in profiles:
-                        self._fandom_row(profile, active.fandom_key == profile.fandom_key)
+            with ui.scroll_area().classes("left-fandom-scroll w-full flex-grow min-h-0"):
+                self.fandoms_container = ui.column().classes("w-full gap-1 items-stretch").style(
+                    "width: 100%; min-width: 100%; max-width: none;"
+                )
+            self._refresh_fandom_rows()
+
+    def _handle_fandom_search(self, event) -> None:
+        self.left_fandom_search_text = str(getattr(event, "args", "") or getattr(event, "value", "") or "")
+        self.container.preferences_service.set("left_fandom_search", self.left_fandom_search_text)
+        self._refresh_fandom_rows()
+
+    def _refresh_fandom_rows(self) -> None:
+        if not self.fandoms_container:
+            return
+        active = self.container.fandom_service.ensure_default()
+        profiles = self._filtered_fandom_profiles()
+        self.fandom_row_refs.clear()
+        self.fandoms_container.clear()
+        with self.fandoms_container:
+            if not profiles:
+                ui.label("No matching fandoms").classes("text-xs text-gray-500 px-1")
+                return
+            for profile in profiles:
+                self._fandom_row(profile, active.fandom_key == profile.fandom_key)
+
+    def _filtered_fandom_profiles(self) -> list[FandomProfile]:
+        profiles = self.container.fandom_service.list_profiles()
+        query = " ".join(self.left_fandom_search_text.casefold().split())
+        if not query:
+            return profiles
+        return [
+            profile
+            for profile in profiles
+            if query
+            in " ".join(
+                [
+                    profile.display_name,
+                    profile.tag,
+                    short_fandom_name(profile.tag),
+                    profile.fandom_key,
+                ]
+            )
+            .casefold()
+        ]
 
     def _fandom_row(self, profile: FandomProfile, selected: bool) -> None:
         r, g, b = rgb_from_hex(profile.color)
-        classes = f"fandom-row w-full items-center gap-2 p-2 cursor-pointer {'fandom-row-selected' if selected else ''}"
+        cleanup_selected = profile.fandom_key in self.fandom_cleanup_selected
+        classes = f"fandom-row w-full items-center gap-2 p-2 cursor-pointer no-wrap min-w-0 {'fandom-row-selected' if selected else ''}"
+        if self.fandom_cleanup_mode:
+            classes += " cleanup-select-row"
+        if cleanup_selected:
+            classes += " cleanup-row-selected"
         row = ui.row().classes(classes).style(f"--accent-r:{r}; --accent-g:{g}; --accent-b:{b};")
-        row.on("click", lambda _=None, key=profile.fandom_key: self._select_fandom_profile(key))
+        row_refs: dict[str, Any] = {"row": row}
+        self.fandom_row_refs[profile.fandom_key] = row_refs
+        if self.fandom_cleanup_mode:
+            row.on("click.stop", lambda _=None, key=profile.fandom_key: self._toggle_fandom_cleanup_selection(key))
+        else:
+            row.on("click", lambda _=None, key=profile.fandom_key: self._select_fandom_profile(key))
         with row:
-            self._fandom_avatar_button(profile, interactive=True)
+            if self.fandom_cleanup_mode:
+                ui.icon("check_circle" if cleanup_selected else "radio_button_unchecked", size="20px").style(
+                    f"color: {'#ef4444' if cleanup_selected else '#6b7280'};"
+                )
+            row_refs["avatar"] = self._fandom_avatar_button(profile, interactive=not self.fandom_cleanup_mode)
             with ui.column().classes("gap-0 min-w-0 flex-grow"):
                 with ui.row().classes("w-full items-center gap-1 min-w-0"):
-                    ui.label(profile.display_name).classes("text-sm font-bold truncate min-w-0 flex-grow").style(
+                    name_label = ui.label(profile.display_name).classes("text-sm font-bold truncate min-w-0 flex-grow").style(
                         glow_text(profile.color, 4) if selected else ""
                     )
-                    edit = ui.button(icon="edit").props("flat round dense size=sm")
-                    edit.style(f"color: {normalized_label_color(profile.color)} !important;")
-                    edit.on("click.stop", lambda _=None, p=profile: self._show_fandom_dialog(p))
-                    with edit:
-                        rich_tooltip("Edit fandom identity", profile.color)
-                ui.label(profile.tag).classes("text-[11px] text-gray-500 truncate")
+                    row_refs["name"] = name_label
+                tag_label = ui.label(profile.tag).classes("text-[11px] text-gray-500 truncate")
+                row_refs["tag"] = tag_label
+            if not self.fandom_cleanup_mode:
+                details = ui.button().props("round dense size=xs :ripple=false")
+                row_refs["details"] = details
+                details.style(
+                    f"background-color: {dark_button_color(profile.color)} !important; min-width: 24px; min-height: 24px; padding: 0;"
+                )
+                details.on("click.stop", lambda _=None, p=profile: self._show_fandom_dialog(p))
+                with details:
+                    rich_tooltip("Edit fandom identity", profile.color)
+                    icon = ui.icon("more_horiz", size="16px").style(glow_text(profile.color, 3))
+                    row_refs["icon"] = icon
+
+    def _update_fandom_row_in_place(self, profile: FandomProfile) -> None:
+        refs = self.fandom_row_refs.get(profile.fandom_key)
+        if not refs:
+            return
+        selected = (self.container.fandom_service.active_profile() or profile).fandom_key == profile.fandom_key
+        r, g, b = rgb_from_hex(profile.color)
+        row = refs.get("row")
+        if row:
+            row.style(replace=f"--accent-r:{r}; --accent-g:{g}; --accent-b:{b};")
+        name_label = refs.get("name")
+        if name_label:
+            name_label.set_text(profile.display_name)
+            name_label.style(replace=glow_text(profile.color, 4) if selected else "")
+        tag_label = refs.get("tag")
+        if tag_label:
+            tag_label.set_text(profile.tag)
+        details = refs.get("details")
+        if details:
+            details.style(
+                replace=f"background-color: {dark_button_color(profile.color)} !important; min-width: 24px; min-height: 24px; padding: 0;"
+            )
+        icon = refs.get("icon")
+        if icon:
+            icon.style(replace=glow_text(profile.color, 3))
+        self._restyle_avatar_refs(refs.get("avatar"), profile.color, profile.display_name)
+
+    def _toggle_fandom_cleanup(self) -> None:
+        self.fandom_cleanup_mode = not self.fandom_cleanup_mode
+        self.fandom_cleanup_selected.clear()
+        self.fandom_cleanup_delete_armed = False
+        self._render_left()
+
+    def _disarm_fandom_cleanup_delete(self) -> None:
+        if self.fandom_cleanup_delete_armed:
+            self.fandom_cleanup_delete_armed = False
+            self._render_left_footer()
+
+    def _toggle_fandom_cleanup_selection(self, fandom_key_value: str) -> None:
+        if fandom_key_value in self.fandom_cleanup_selected:
+            self.fandom_cleanup_selected.discard(fandom_key_value)
+        else:
+            self.fandom_cleanup_selected.add(fandom_key_value)
+        self.fandom_cleanup_delete_armed = False
+        self._render_left_footer()
+        self._refresh_fandom_rows()
+
+    def _handle_fandom_cleanup_delete(self) -> None:
+        if not self.fandom_cleanup_selected:
+            self._notify("Select one or more fandoms first.", "warning")
+            self.fandom_cleanup_delete_armed = False
+            self._render_left_footer()
+            return
+        if not self.fandom_cleanup_delete_armed:
+            self.fandom_cleanup_delete_armed = True
+            self._render_left_footer()
+            return
+        self._show_fandom_cleanup_delete_dialog()
+
+    def _show_create_fandom_dialog(self) -> None:
+        active = self.container.fandom_service.ensure_default()
+        accent = active.color or "#58a6ff"
+        r, g, b = rgb_from_hex(accent)
+        base_dialog_style = (
+            wash_background(accent, 0.14)
+            + f"width: 560px; max-width: 94vw; height: 85vh; max-height: calc(100vh - 24px); border: 1px solid rgba({r},{g},{b},0.24);"
+        )
+        draft: dict[str, Any] = {"query": "", "selected": None, "_last_query": ""}
+        refs: dict[str, Any] = {}
+
+        def render_suggestions(event=None) -> None:
+            row = refs.get("suggestions")
+            if not row:
+                return
+            if event is not None:
+                next_query = self._event_value(event, "")
+                if next_query != draft.get("query"):
+                    draft["selected"] = None
+                draft["query"] = next_query
+            query = str(draft.get("query") or "").strip()
+            if query != draft.get("_last_query"):
+                draft["selected"] = None
+                draft["_last_query"] = query
+            row.clear()
+            with row:
+                if not query:
+                    draft["selected"] = None
+                    ui.label("Type a fandom name. Cache AO3 fandom categories from the footer if suggestions are empty.").classes(
+                        "text-xs text-gray-500"
+                    )
+                    return
+                try:
+                    suggestions = self.container.fandom_service.suggest_fandoms(query, 32)
+                except Exception as exc:  # noqa: BLE001
+                    ui.label(f"Cached fandom suggestions failed: {exc}").classes("text-xs text-red-300")
+                    return
+                if not suggestions:
+                    sources = self.container.fandom_service.ensure_fandom_directory_sources()
+                    cached_total = sum(source.cached_count for source in sources)
+                    message = "No cached fandom suggestions found."
+                    if not cached_total:
+                        message = "No fandom directory cache yet. Open the footer cache manager and cache selected categories."
+                    ui.label(message).classes("text-xs text-gray-500")
+                    return
+                for suggestion in suggestions:
+                    selected = bool(draft.get("selected") and getattr(draft["selected"], "tag", "") == suggestion.tag)
+                    color = self._normalize_hex(str(suggestion.color or "")) or accent
+                    pill = ui.button(suggestion.label, on_click=lambda _=None, s=suggestion: select_suggestion(s)).props(
+                        "dense rounded flat no-caps"
+                    )
+                    pill.classes("max-w-full")
+                    if selected:
+                        pill.style(self._filter_pill_style(color, True))
+                    else:
+                        pill.style(
+                            f"border: 1px solid rgba({','.join(str(v) for v in rgb_from_hex(color))},0.32); "
+                            f"color: {normalized_label_color(color)} !important; overflow: hidden; text-overflow: ellipsis;"
+                        )
+                    with pill:
+                        tooltip = suggestion.tag
+                        if suggestion.media_label:
+                            tooltip = f"{suggestion.media_label} | {suggestion.tag}"
+                        rich_tooltip(tooltip, color)
+
+        def select_suggestion(suggestion) -> None:
+            draft["selected"] = suggestion
+            render_suggestions()
+
+        def schedule_suggestions_render() -> None:
+            ui.timer(0.03, render_suggestions, once=True)
+
+        def create_fandom() -> None:
+            suggestion = draft.get("selected")
+            if not suggestion:
+                self._notify("Pick a fandom suggestion first.", "warning")
+                return
+            try:
+                profile = self.container.fandom_service.create_from_suggestion(suggestion)
+            except Exception as exc:  # noqa: BLE001
+                self._notify(f"Create fandom failed: {exc}", "negative")
+                return
+            state = dict(default_fandom_filter(profile.tag))
+            state.update(profile.default_filter or {})
+            state["fandom"] = profile.tag
+            self.container.preferences_service.set("browse_filter_state", state)
+            self.container.preferences_service.set("last_context_type", "fandom")
+            self.container.preferences_service.set("last_context_key", profile.tag)
+            self.page = "Browse"
+            self.container.preferences_service.set("active_page", "Browse")
+            dialog.close()
+            self._invalidate_browse_page_model()
+            self.refresh()
+            self._notify(f"Created fandom: {profile.display_name}.", "positive")
+
+        dialog = ui.dialog()
+        dialog.on("hide", dialog.delete)
+        with dialog, ui.card().classes("flex flex-col p-0 gap-0 overflow-hidden").style(base_dialog_style):
+            with ui.row().classes("w-full items-center justify-between p-4 border-b border-gray-700 shrink-0").style(
+                "background: rgba(22, 27, 34, 0.75); backdrop-filter: blur(8px);"
+            ):
+                ui.label("Create Fandom").classes("text-lg font-bold").style(glow_text(accent, 4))
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense color=white")
+            with ui.column().classes("w-full gap-3 p-4 flex-grow min-h-0"):
+                query = (
+                    ui.input("Search AO3 fandoms", value=draft["query"])
+                    .bind_value(draft, "query")
+                    .props("dark outlined dense clearable")
+                    .classes("w-full")
+                )
+                query.on("update:model-value", lambda _=None: schedule_suggestions_render())
+                query.on("keyup", lambda _=None: schedule_suggestions_render())
+                with ui.scroll_area().classes("w-full flex-grow min-h-0"):
+                    refs["suggestions"] = ui.row().classes("w-full gap-1 flex-wrap content-start")
+                    render_suggestions()
+            with ui.row().classes("w-full items-center justify-between p-3 border-t border-gray-700 shrink-0").style(
+                "background: rgba(13, 17, 23, 0.78);"
+            ):
+                cache_btn = ui.button(icon="travel_explore", on_click=lambda _=None: self._show_fandom_directory_cache_dialog(render_suggestions))
+                cache_btn.props("flat round dense color=white")
+                cache_btn.style(f"color: {normalized_label_color(accent)} !important;")
+                with cache_btn:
+                    rich_tooltip("Manage cached AO3 fandom categories", accent)
+                ui.button("Create", icon="add", on_click=create_fandom).style(
+                    f"background-color: {dark_button_color(accent)} !important; color: white;"
+                )
+        dialog.open()
+
+    def _show_fandom_directory_cache_dialog(self, suggestions_refresh: Callable[[], None] | None = None) -> None:
+        active = self.container.fandom_service.ensure_default()
+        accent = active.color or "#58a6ff"
+        r, g, b = rgb_from_hex(accent)
+        dialog_style = (
+            wash_background(accent, 0.14)
+            + f"width: 560px; max-width: 94vw; height: 85vh; max-height: calc(100vh - 24px); border: 1px solid rgba({r},{g},{b},0.24);"
+        )
+        state: dict[str, Any] = {"loading": False, "sources": self.container.fandom_service.ensure_fandom_directory_sources()}
+        refs: dict[str, Any] = {}
+
+        def reload_sources() -> None:
+            state["sources"] = self.container.fandom_service.ensure_fandom_directory_sources()
+
+        def refresh_parent_suggestions() -> None:
+            if suggestions_refresh:
+                suggestions_refresh()
+
+        def render_sources() -> None:
+            container = refs.get("sources")
+            if not container:
+                return
+            container.clear()
+            with container:
+                sources = list(state.get("sources") or [])
+                if not sources:
+                    ui.label("No AO3 fandom categories are configured yet.").classes("text-xs text-gray-500")
+                    return
+                for source in sources:
+                    color = self._normalize_hex(str(source.color or "")) or "#58a6ff"
+                    row = ui.row().classes("w-full items-center gap-2 rounded-md px-2 py-1")
+                    row.style(
+                        f"border: 1px solid rgba({','.join(str(v) for v in rgb_from_hex(color))},0.18); "
+                        f"background: rgba({','.join(str(v) for v in rgb_from_hex(color))},0.05);"
+                    )
+                    with row:
+                        enabled = bool(source.enabled)
+                        check = ui.button(
+                            icon="check_box" if enabled else "check_box_outline_blank",
+                            on_click=lambda _=None, s=source: toggle_source_enabled(s, not bool(s.enabled)),
+                        )
+                        check.props("flat round dense color=white")
+                        check.style(f"color: {normalized_label_color(color) if enabled else '#64748b'} !important;")
+                        label = ui.label(source.label).classes("text-sm font-semibold cursor-context-menu min-w-0 flex-grow truncate")
+                        label.style(glow_text(color, 2))
+                        label.on("contextmenu", lambda _=None: None, js_handler="(event) => { event.stopPropagation(); emit(); }")
+                        with label:
+                            rich_tooltip(source.url, color)
+                            with ui.context_menu().classes("tag-favorite-menu"):
+                                ui.menu_item("Color", on_click=lambda _=None, s=source: open_source_color_dialog(s)).style(
+                                    f"color: {normalized_label_color(color)};"
+                                )
+                                ui.menu_item("Refresh this category", on_click=lambda _=None, s=source: start_cache_sources([s.media_key])).style(
+                                    f"color: {normalized_label_color(color)};"
+                                )
+                                ui.menu_item("Delete this cache", on_click=lambda _=None, s=source: delete_source_cache(s)).style(
+                                    "color: #fb7185;"
+                                )
+                        cache_text = f"{source.cached_count:,} cached" if source.cached_count else "not cached"
+                        ui.label(cache_text).classes("text-xs text-gray-500 shrink-0")
+
+        def render_footer() -> None:
+            footer = refs.get("footer")
+            if not footer:
+                return
+            footer.clear()
+            with footer:
+                refresh_index = ui.button(icon="sync", on_click=lambda _=None: start_refresh_index()).props("flat round dense color=white")
+                refresh_index.style(f"color: {normalized_label_color(accent)} !important; opacity: {0.56 if state['loading'] else 0.94};")
+                with refresh_index:
+                    rich_tooltip("Refresh AO3 category list", accent)
+                ui.space()
+                cache = ui.button(
+                    "Cache Selected",
+                    icon="download",
+                    on_click=lambda _=None: start_cache_sources(
+                        [source.media_key for source in state.get("sources", []) if bool(source.enabled)]
+                    ),
+                )
+                cache.props("dense no-caps")
+                cache.style(
+                    f"background-color: {dark_button_color(accent)} !important; color: white; "
+                    f"opacity: {0.56 if state['loading'] else 1};"
+                )
+
+        def toggle_source_enabled(source: Any, enabled: bool) -> None:
+            result = self.container.fandom_service.update_fandom_directory_source(source.media_key, enabled=enabled)
+            if not result.ok:
+                self._notify(result.message, "negative")
+            reload_sources()
+            render_sources()
+
+        def delete_source_cache(source: Any) -> None:
+            result = self.container.fandom_service.delete_fandom_directory_cache(source.media_key)
+            self._notify(result.message, "positive" if result.ok else "negative")
+            reload_sources()
+            render_sources()
+            refresh_parent_suggestions()
+
+        def open_source_color_dialog(source: Any) -> None:
+            color = self._normalize_hex(str(source.color or "")) or "#58a6ff"
+            draft = {"color": color}
+            color_dialog = ui.dialog()
+            color_dialog.on("hide", color_dialog.delete)
+
+            def save_color() -> None:
+                result = self.container.fandom_service.update_fandom_directory_source(source.media_key, color=str(draft.get("color") or ""))
+                self._notify(result.message, "positive" if result.ok else "negative")
+                if result.ok:
+                    color_dialog.close()
+                    reload_sources()
+                    render_sources()
+                    refresh_parent_suggestions()
+
+            with color_dialog, ui.card().classes("w-[340px] max-w-[94vw] p-0 gap-0 overflow-hidden").style(wash_background(color, 0.14)):
+                with ui.row().classes("w-full items-center justify-between p-3 border-b border-gray-700").style(
+                    "background: rgba(22, 27, 34, 0.75);"
+                ):
+                    ui.label(f"{source.label} Color").classes("text-base font-bold").style(glow_text(color, 4))
+                    ui.button(icon="close", on_click=color_dialog.close).props("flat round dense color=white")
+                with ui.column().classes("w-full gap-3 p-3"):
+                    ui.color_input("Color", value=draft["color"]).bind_value(draft, "color").props("dark outlined dense").classes("w-full")
+                with ui.row().classes("w-full items-center justify-end p-3 border-t border-gray-700"):
+                    ui.button("Save", icon="save", on_click=save_color).style(
+                        f"background-color: {dark_button_color(color)} !important; color: white;"
+                    )
+            color_dialog.open()
+
+        async def refresh_index() -> None:
+            if state["loading"]:
+                return
+            state["loading"] = True
+            render_footer()
+            try:
+                result = await run.io_bound(self.container.fandom_service.refresh_fandom_directory_sources)
+                self._notify(result.message, "positive" if result.ok else "negative")
+            except Exception as exc:  # noqa: BLE001
+                self._notify(f"AO3 category refresh failed: {exc}", "negative")
+            finally:
+                state["loading"] = False
+                reload_sources()
+                render_sources()
+                render_footer()
+
+        def start_refresh_index() -> None:
+            background_tasks.create(refresh_index(), name="ao3-fandom-directory-index")
+
+        async def cache_sources(media_keys: list[str] | None) -> None:
+            if state["loading"]:
+                return
+            selected_keys = [str(key) for key in media_keys or [] if str(key).strip()]
+            if not selected_keys:
+                self._notify("Select at least one fandom category to cache.", "warning")
+                return
+            state["loading"] = True
+            render_footer()
+            self._notify("Caching AO3 fandom category tags...", "info")
+            try:
+                result = await run.io_bound(lambda: self.container.fandom_service.cache_fandom_directory_sources(selected_keys))
+                self._notify(result.message, "positive" if result.ok else "negative")
+                refresh_parent_suggestions()
+            except Exception as exc:  # noqa: BLE001
+                self._notify(f"AO3 fandom category cache failed: {exc}", "negative")
+            finally:
+                state["loading"] = False
+                reload_sources()
+                render_sources()
+                render_footer()
+
+        def start_cache_sources(media_keys: list[str] | None) -> None:
+            background_tasks.create(cache_sources(media_keys), name="ao3-fandom-directory-cache")
+
+        dialog = ui.dialog()
+        dialog.on("hide", dialog.delete)
+        with dialog, ui.card().classes("flex flex-col p-0 gap-0 overflow-hidden").style(dialog_style):
+            with ui.row().classes("w-full items-center justify-between p-4 border-b border-gray-700 shrink-0").style(
+                "background: rgba(22, 27, 34, 0.75); backdrop-filter: blur(8px);"
+            ):
+                ui.label("AO3 Fandom Directory Cache").classes("text-lg font-bold").style(glow_text(accent, 4))
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense color=white")
+            with ui.column().classes("w-full gap-3 p-4 flex-grow min-h-0"):
+                ui.label("Choose which AO3 media categories feed Create Fandom suggestions.").classes("text-xs text-gray-500")
+                with ui.scroll_area().classes("w-full flex-grow min-h-0"):
+                    refs["sources"] = ui.column().classes("w-full gap-2")
+                    render_sources()
+            refs["footer"] = ui.row().classes("w-full items-center gap-2 p-3 border-t border-gray-700 shrink-0").style(
+                "background: rgba(13, 17, 23, 0.78);"
+            )
+            render_footer()
+        dialog.open()
+
+    def _download_fandom_backup(self, fandom_key_value: str) -> bool:
+        try:
+            filename, payload = self.container.fandom_service.export_fandom_backup(fandom_key_value)
+        except Exception as exc:  # noqa: BLE001
+            self._notify(f"Fandom backup failed: {exc}", "negative")
+            return False
+        ui.download(payload, filename, media_type="application/zip")
+        self._notify(f"Saved backup: {filename}", "positive")
+        return True
+
+    def _show_fandom_cleanup_delete_dialog(self) -> None:
+        selected = [profile for profile in self.container.fandom_service.list_profiles() if profile.fandom_key in self.fandom_cleanup_selected]
+        if not selected:
+            self._notify("Select one or more fandoms first.", "warning")
+            return
+        active = self.container.fandom_service.ensure_default()
+        state = {"backed_up": False}
+
+        def save_backup() -> None:
+            ok = True
+            for profile in selected:
+                ok = self._download_fandom_backup(profile.fandom_key) and ok
+            state["backed_up"] = ok
+            render_footer()
+
+        def delete_now() -> None:
+            if not state["backed_up"]:
+                self._notify("Save the backup before deleting.", "warning")
+                return
+            result = self.container.fandom_service.delete_fandoms_after_backup([profile.fandom_key for profile in selected])
+            self.fandom_cleanup_mode = False
+            self.fandom_cleanup_selected.clear()
+            self.fandom_cleanup_delete_armed = False
+            dialog.close()
+            self._invalidate_browse_page_model()
+            self.refresh()
+            self._notify(result.message, "positive" if result.ok else "negative")
+
+        def render_footer() -> None:
+            footer = refs.get("footer")
+            if not footer:
+                return
+            footer.clear()
+            with footer:
+                ui.button("Save Backup", icon="archive", on_click=save_backup).props("dense no-caps").style(
+                    f"background-color: {dark_button_color(active.color)} !important; color: white;"
+                )
+                delete_btn = ui.button("Delete Fandom", icon="delete", on_click=delete_now).props("dense no-caps")
+                delete_btn.style(
+                    f"background-color: {'#7f1d1d' if state['backed_up'] else '#374151'} !important; color: white; opacity: {1 if state['backed_up'] else 0.48};"
+                )
+
+        refs: dict[str, Any] = {}
+        dialog = ui.dialog()
+        dialog.on("hide", dialog.delete)
+        with dialog, ui.card().classes("w-[520px] max-w-[94vw] p-0 gap-0 overflow-hidden").style(wash_background("#ef4444", 0.12)):
+            with ui.row().classes("w-full items-center justify-between p-3 border-b border-gray-700"):
+                ui.label("Delete Fandom Backup Required").classes("text-lg font-bold").style(glow_text("#ef4444", 4))
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense color=white")
+            with ui.column().classes("w-full gap-2 p-3"):
+                ui.label("A portable backup zip must be saved before deletion is enabled.").classes("text-sm text-gray-300")
+                for profile in selected:
+                    ui.label(profile.display_name).classes("text-sm font-bold").style(glow_text(profile.color, 3))
+            refs["footer"] = ui.row().classes("w-full items-center justify-end gap-2 p-3 border-t border-gray-700")
+            render_footer()
+        dialog.open()
 
     def _select_fandom_profile(self, fandom_key_value: str) -> None:
+        self._persist_fandom_page()
         profile = self.container.fandom_service.select(fandom_key_value)
-        state = dict(default_fandom_filter(profile.tag))
-        state.update(profile.default_filter or {})
-        state["fandom"] = profile.tag
+        state = self._browse_filter_state()
         self.container.preferences_service.set("browse_filter_state", state)
         self.container.preferences_service.set("last_context_type", "fandom")
         self.container.preferences_service.set("last_context_key", profile.tag)
-        self.page = "Browse"
-        self.container.preferences_service.set("active_page", "Browse")
+        self.page = self._restore_fandom_page(profile.fandom_key)
+        self.container.preferences_service.set("active_page", self.page)
         self.refresh()
 
-    def _fandom_avatar_button(self, profile: FandomProfile, *, interactive: bool = True) -> None:
-        def content() -> None:
-            self._avatar_image(profile.avatar_url, profile.display_name, profile.color, "34px", "200px")
+    def _fandom_avatar_button(self, profile: FandomProfile, *, interactive: bool = True) -> dict[str, Any] | None:
+        avatar_refs: dict[str, Any] | None = None
+
+        def content() -> dict[str, Any] | None:
+            return self._avatar_image(profile.avatar_url, profile.display_name, profile.color, "34px", "200px")
 
         if not interactive:
             with ui.element("div").classes("p-0 m-0 relative w-[34px] h-[34px] shrink-0"):
-                content()
-            return
+                avatar_refs = content()
+            return avatar_refs
         avatar_btn = ui.button().props("flat round dense").classes("p-0 m-0 relative")
         avatar_btn.on("click.stop", lambda _=None, p=profile: self._open_fandom_avatar_dialog(p))
         with avatar_btn:
-            content()
+            avatar_refs = content()
+        return avatar_refs
 
     def _character_avatar_button(
         self,
@@ -1053,14 +1604,16 @@ class AO3StudioShell:
         color: str,
         rerender: Callable[[], None] | None = None,
         fandom_key_value: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         avatar_btn = ui.button().props("flat round dense").classes("p-0 m-0 relative")
         avatar_btn.on(
             "click.stop",
             lambda _=None, cid=character_id, n=name, c=color, r=rerender, fk=fandom_key_value: self._open_character_avatar_dialog(cid, n, c, r, fk),
         )
+        avatar_refs: dict[str, Any] | None = None
         with avatar_btn:
-            self._avatar_image(avatar_url, name, color, "34px", "200px")
+            avatar_refs = self._avatar_image(avatar_url, name, color, "34px", "200px")
+        return avatar_refs
 
     def _avatar_image(
         self,
@@ -1071,8 +1624,9 @@ class AO3StudioShell:
         big_size: str,
         *,
         expand_side: str = "right",
-    ) -> None:
+    ) -> dict[str, Any]:
         src = self._avatar_src(avatar_url)
+        avatar_refs: dict[str, Any] = {"small_size": small_size, "big_size": big_size, "has_src": bool(src)}
         tooltip_anchor = "center left" if expand_side == "left" else "center right"
         tooltip_self = "center right" if expand_side == "left" else "center left"
         tooltip_props = (
@@ -1080,23 +1634,55 @@ class AO3StudioShell:
             'transition-show="scale" transition-hide="scale" :delay="0" :hide-delay="0"'
         )
         if src:
-            ui.image(src).classes("rounded-full object-cover").style(f"width:{small_size}; height:{small_size}; {self._styled_border_css(color)}")
+            avatar_refs["small"] = ui.image(src).classes("rounded-full object-cover").style(
+                self._avatar_visual_style(color, small_size, has_src=True)
+            )
             with ui.tooltip().classes("bg-transparent shadow-none pointer-events-none").props(tooltip_props).style(
                 "padding: 16px; overflow: visible; width: 232px; height: 232px; box-sizing: border-box; will-change: transform;"
             ):
-                ui.image(src).classes("rounded-full object-cover").style(f"width:{big_size}; height:{big_size}; {self._styled_border_css(color)}")
-            return
+                avatar_refs["big"] = ui.image(src).classes("rounded-full object-cover").style(
+                    self._avatar_visual_style(color, big_size, has_src=True)
+                )
+            return avatar_refs
         with ui.element("div").classes("rounded-full flex items-center justify-center").style(
-            f"width:{small_size}; height:{small_size}; background: rgba({','.join(str(v) for v in rgb_from_hex(color))},0.20); {self._styled_border_css(color)}"
-        ):
-            ui.label((label or "?")[:1].upper()).classes("text-sm font-bold").style(f"color: {normalized_label_color(color)};")
+            self._avatar_visual_style(color, small_size, has_src=False)
+        ) as small:
+            avatar_refs["small"] = small
+            avatar_refs["small_label"] = ui.label((label or "?")[:1].upper()).classes("text-sm font-bold").style(
+                f"color: {normalized_label_color(color)};"
+            )
         with ui.tooltip().classes("bg-transparent shadow-none pointer-events-none").props(tooltip_props).style(
             "padding: 16px; overflow: visible; width: 232px; height: 232px; box-sizing: border-box; will-change: transform;"
         ):
             with ui.element("div").classes("rounded-full flex items-center justify-center").style(
-                f"width:{big_size}; height:{big_size}; background: rgba({','.join(str(v) for v in rgb_from_hex(color))},0.20); {self._styled_border_css(color)}"
-            ):
-                ui.label((label or "?")[:1].upper()).classes("text-5xl font-bold").style(f"color: {normalized_label_color(color)};")
+                self._avatar_visual_style(color, big_size, has_src=False)
+            ) as big:
+                avatar_refs["big"] = big
+                avatar_refs["big_label"] = ui.label((label or "?")[:1].upper()).classes("text-5xl font-bold").style(
+                    f"color: {normalized_label_color(color)};"
+                )
+        return avatar_refs
+
+    def _avatar_visual_style(self, color: str, size: str, *, has_src: bool) -> str:
+        r, g, b = rgb_from_hex(color)
+        background = "" if has_src else f"background: rgba({r},{g},{b},0.20); "
+        return f"width:{size}; height:{size}; {background}{self._styled_border_css(color)}"
+
+    def _restyle_avatar_refs(self, avatar_refs: Any, color: str, label: str) -> None:
+        if not isinstance(avatar_refs, dict):
+            return
+        has_src = bool(avatar_refs.get("has_src"))
+        for key in ("small", "big"):
+            visual = avatar_refs.get(key)
+            size = str(avatar_refs.get(f"{key}_size") or "")
+            if visual and size:
+                visual.style(replace=self._avatar_visual_style(color, size, has_src=has_src))
+        initial = (label or "?")[:1].upper()
+        for key in ("small_label", "big_label"):
+            label_ref = avatar_refs.get(key)
+            if label_ref:
+                label_ref.set_text(initial)
+                label_ref.style(replace=f"color: {normalized_label_color(color)};")
 
     @staticmethod
     def _avatar_src(avatar_url: str | None) -> str:
@@ -1214,6 +1800,21 @@ class AO3StudioShell:
         size = float(settings.get("reader_font_size") or 16.5)
         return f"font-family: {font}; font-size: {size}px; {AO3StudioShell._font_typography_css(font, size)}"
 
+    @staticmethod
+    def _character_reader_style_overrides(character: CharacterProfile | None) -> dict[str, Any]:
+        if not character:
+            return {}
+        return normalize_character_reader_style(getattr(character, "reader_style", {}) or {})
+
+    def _reader_font_style_for_character(self, settings: dict[str, Any], character: CharacterProfile | None) -> str:
+        style = dict(settings)
+        character_style = self._character_reader_style_overrides(character)
+        if character_style.get("custom_font_enabled"):
+            style["preview_font_family"] = character_style.get("font_family") or style.get("preview_font_family")
+        if character_style.get("font_size_enabled"):
+            style["reader_font_size"] = character_style.get("font_size") or style.get("reader_font_size")
+        return self._reader_font_style(style)
+
     def _render_style_controls(
         self,
         *,
@@ -1221,6 +1822,7 @@ class AO3StudioShell:
         accent: str,
         save_handler: Callable[[dict[str, Any]], None],
         enabled_state: dict[str, bool] | None = None,
+        live_update_handler: Callable[[dict[str, Any]], None] | None = None,
         show_thresholds: bool = False,
         show_save_button: bool = True,
     ) -> None:
@@ -1228,19 +1830,43 @@ class AO3StudioShell:
         style_state = settings
         ar, ag, ab = rgb_from_hex(accent)
 
-        def controls_enabled() -> bool:
-            return enabled_state is None or bool(enabled_state.get("enabled"))
+        def event_bool(event, fallback: bool = False) -> bool:
+            return self._event_bool(event, fallback=fallback)
 
-        def muted() -> str:
-            return "" if controls_enabled() else "opacity: 0.42;"
+        def event_value(event, fallback: Any = None) -> Any:
+            return self._event_value(event, fallback=fallback)
+
+        def section_enabled(section: str) -> bool:
+            return enabled_state is None or bool(enabled_state.get(section))
+
+        def muted(section: str) -> str:
+            return "" if section_enabled(section) else "opacity: 0.42;"
+
+        def sync_sections() -> None:
+            if enabled_state is not None:
+                style_state[STYLE_OVERRIDE_SECTIONS_KEY] = {
+                    "font": bool(enabled_state.get("font")),
+                    "rarity": bool(enabled_state.get("rarity")),
+                }
+
+        def apply_live_update() -> None:
+            sync_sections()
+            if live_update_handler:
+                live_update_handler(style_state)
+
+        def save_current_style() -> None:
+            sync_sections()
+            save_handler(style_state)
 
         def set_font(font_value: str) -> None:
             style_state["preview_font_family"] = font_value
             render_font_pills()
+            apply_live_update()
 
         def set_mode(mode_value: str) -> None:
             style_state["gradient_border_mode"] = mode_value
             render_mode_pills()
+            apply_live_update()
 
         def render_font_pills() -> None:
             container = refs.get("fonts")
@@ -1262,7 +1888,7 @@ class AO3StudioShell:
                         pill.style(
                             f"background: rgba({r},{g},{b},{bg}) !important; border: 1px solid rgba({r},{g},{b},{border}); "
                             f"color: {color} !important; font-family: {font_value}; {self._font_variation_css(font_value)} "
-                            f"text-shadow: {'0 0 6px ' + color if selected else 'none'}; {muted()}"
+                            f"text-shadow: {'0 0 6px ' + color if selected else 'none'}; {muted('font')}"
                         )
                         with pill:
                             ui.tooltip(full_name).classes("text-sm").style(
@@ -1284,7 +1910,7 @@ class AO3StudioShell:
                     pill.style(
                         f"background: rgba({ar},{ag},{ab},{0.24 if selected else 0.07}) !important; "
                         f"border: 1px solid rgba({ar},{ag},{ab},{0.54 if selected else 0.18}); "
-                        f"color: {normalized_label_color(accent)} !important; {muted()}"
+                        f"color: {normalized_label_color(accent)} !important; {muted('rarity')}"
                     )
 
         def open_rarity_map() -> None:
@@ -1309,6 +1935,7 @@ class AO3StudioShell:
                 with ui.row().classes("w-full justify-end p-3 border-t border-gray-700"):
                     def save_map() -> None:
                         style_state["rarity_map"] = draft
+                        apply_live_update()
                         dialog.close()
 
                     ui.button("Done", icon="check", on_click=save_map).style(
@@ -1344,59 +1971,95 @@ class AO3StudioShell:
                     )
             dialog.open()
 
-        if enabled_state is not None:
-            with ui.row().classes("w-full items-center justify-between soft-panel p-3"):
-                ui.label("Use fandom style override").classes("text-sm font-bold").style(glow_text(accent, 3))
-                ui.switch(value=enabled_state["enabled"]).bind_value(enabled_state, "enabled").props("dense color=primary")
+        def handle_enabled_toggle(section: str, event) -> None:
+            if enabled_state is None:
+                return
+            enabled_state[section] = event_bool(event, not bool(enabled_state.get(section)))
+            apply_live_update()
+            render_control_body()
 
-        with ui.column().classes("w-full gap-3").style(muted()):
-            with ui.element("div").classes("soft-panel w-full p-3"):
-                with ui.row().classes("w-full items-center justify-between"):
-                    ui.label("Font Family").classes("text-sm font-bold").style(glow_text(accent, 3))
-                    if show_thresholds:
-                        thresholds = ui.button(icon="tune").props("flat round dense")
-                        thresholds.style(f"color: {normalized_label_color(accent)} !important;")
-                        thresholds.on("click.stop", lambda _=None: open_thresholds())
-                        with thresholds:
-                            rich_tooltip("Rarity thresholds", accent)
-                refs["fonts"] = ui.row().classes("w-full gap-2 flex-wrap mt-2")
-                render_font_pills()
-            with ui.element("div").classes("soft-panel w-full p-3"):
-                ui.label("Font Size").classes("text-sm font-bold").style(glow_text(accent, 3))
-                with ui.row().classes("w-full gap-2"):
-                    ui.number("Current Font Size", value=style_state.get("reader_font_size", 16.5), min=8, max=48, step=0.5).bind_value(
-                        style_state,
-                        "reader_font_size",
-                    ).props("dark outlined dense").classes("flex-grow")
-                    ui.number("Mouse Wheel Font Step", value=style_state.get("font_wheel_step_px", 0.5), min=0.5, max=10, step=0.5).bind_value(
-                        style_state,
-                        "font_wheel_step_px",
-                    ).props("dark outlined dense").classes("flex-grow")
-            with ui.element("div").classes("soft-panel w-full p-3"):
-                ui.label("Rarity Borders").classes("text-sm font-bold").style(glow_text(accent, 3))
-                with ui.row().classes("w-full gap-2 items-center"):
-                    ui.number("Rarity Border Thickness", value=style_state.get("border_thickness", 1.0), min=0, max=12, step=0.5).bind_value(
-                        style_state,
-                        "border_thickness",
-                    ).props("dark outlined dense").classes("w-56")
-                    ui.switch("Gradient Border", value=style_state.get("gradient_border_enabled", False)).bind_value(
-                        style_state,
-                        "gradient_border_enabled",
-                    ).props("dense")
-                    ui.switch("Rarity Map", value=style_state.get("rarity_map_enabled", False)).bind_value(
-                        style_state,
-                        "rarity_map_enabled",
-                    ).props("dense")
-                    map_btn = ui.button(icon="auto_awesome", on_click=open_rarity_map).props("flat round dense")
-                    map_btn.style(f"color: {normalized_label_color(accent)} !important;")
-                    with map_btn:
-                        rich_tooltip("Configure rarity border modes", accent)
-                refs["modes"] = ui.row().classes("w-full gap-2 flex-wrap mt-2")
-                render_mode_pills()
-            if show_save_button:
-                with ui.row().classes("w-full justify-end"):
-                    save = ui.button("Save", icon="save", on_click=lambda: save_handler(style_state)).props("dense")
-                    save.style(f"background-color: {dark_button_color(accent)} !important; color: white;")
+        def handle_style_value(key: str, event, *, as_bool: bool = False) -> None:
+            style_state[key] = event_bool(event, not bool(style_state.get(key))) if as_bool else event_value(event, style_state.get(key))
+            apply_live_update()
+
+        def render_control_body() -> None:
+            body = refs.get("body")
+            if not body:
+                return
+            body.clear()
+            with body:
+                with ui.column().classes("w-full gap-3"):
+                    with ui.element("div").classes("soft-panel w-full p-3"):
+                        with ui.row().classes("w-full items-center justify-between"):
+                            ui.label("Font Family").classes("text-sm font-bold").style(glow_text(accent, 3))
+                            if enabled_state is not None:
+                                font_switch = ui.switch(value=bool(enabled_state.get("font"))).props("dense color=primary")
+                                font_switch.on(
+                                    "update:model-value",
+                                    lambda event: handle_enabled_toggle("font", event),
+                                    js_handler="value => emit(value)",
+                                )
+                        refs["fonts"] = ui.row().classes("w-full gap-2 flex-wrap mt-2").style(muted("font"))
+                        render_font_pills()
+                    with ui.element("div").classes("soft-panel w-full p-3").style(muted("font")):
+                        ui.label("Font Size").classes("text-sm font-bold").style(glow_text(accent, 3))
+                        with ui.row().classes("w-full gap-2"):
+                            font_size = ui.number("Current Font Size", value=style_state.get("reader_font_size", 16.5), min=8, max=48, step=0.5).bind_value(
+                                style_state,
+                                "reader_font_size",
+                            ).props("dark outlined dense").classes("flex-grow")
+                            font_size.on("update:model-value", lambda event=None: handle_style_value("reader_font_size", event))
+                            wheel_step = ui.number("Mouse Wheel Font Step", value=style_state.get("font_wheel_step_px", 0.5), min=0.5, max=10, step=0.5).bind_value(
+                                style_state,
+                                "font_wheel_step_px",
+                            ).props("dark outlined dense").classes("flex-grow")
+                            wheel_step.on("update:model-value", lambda event=None: handle_style_value("font_wheel_step_px", event))
+                    with ui.element("div").classes("soft-panel w-full p-3"):
+                        with ui.row().classes("w-full items-center justify-between"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.label("Rarity Borders").classes("text-sm font-bold").style(glow_text(accent, 3))
+                                if show_thresholds:
+                                    thresholds = ui.button(icon="tune").props("flat round dense")
+                                    thresholds.style(f"color: {normalized_label_color(accent)} !important;")
+                                    thresholds.on("click.stop", lambda _=None: open_thresholds())
+                                    with thresholds:
+                                        rich_tooltip("Rarity thresholds", accent)
+                            if enabled_state is not None:
+                                rarity_switch = ui.switch(value=bool(enabled_state.get("rarity"))).props("dense color=primary")
+                                rarity_switch.on(
+                                    "update:model-value",
+                                    lambda event: handle_enabled_toggle("rarity", event),
+                                    js_handler="value => emit(value)",
+                                )
+                        with ui.row().classes("w-full gap-2 items-center mt-2").style(muted("rarity")):
+                            border_thickness = ui.number("Rarity Border Thickness", value=style_state.get("border_thickness", 1.0), min=0, max=12, step=0.5).bind_value(
+                                style_state,
+                                "border_thickness",
+                            ).props("dark outlined dense").classes("w-56")
+                            border_thickness.on("update:model-value", lambda event=None: handle_style_value("border_thickness", event))
+                            gradient_switch = ui.switch("Gradient Border", value=style_state.get("gradient_border_enabled", False)).bind_value(
+                                style_state,
+                                "gradient_border_enabled",
+                            ).props("dense")
+                            gradient_switch.on("update:model-value", lambda event=None: handle_style_value("gradient_border_enabled", event, as_bool=True))
+                            rarity_map_switch = ui.switch("Rarity Map", value=style_state.get("rarity_map_enabled", False)).bind_value(
+                                style_state,
+                                "rarity_map_enabled",
+                            ).props("dense")
+                            rarity_map_switch.on("update:model-value", lambda event=None: handle_style_value("rarity_map_enabled", event, as_bool=True))
+                            map_btn = ui.button(icon="auto_awesome", on_click=open_rarity_map).props("flat round dense")
+                            map_btn.style(f"color: {normalized_label_color(accent)} !important;")
+                            with map_btn:
+                                rich_tooltip("Configure rarity border modes", accent)
+                        refs["modes"] = ui.row().classes("w-full gap-2 flex-wrap mt-2").style(muted("rarity"))
+                        render_mode_pills()
+                    if show_save_button:
+                        with ui.row().classes("w-full justify-end"):
+                            save = ui.button("Save", icon="save", on_click=lambda: save_current_style()).props("dense")
+                            save.style(f"background-color: {dark_button_color(accent)} !important; color: white;")
+
+        refs["body"] = ui.element("div").classes("w-full")
+        render_control_body()
 
     def _show_fandom_dialog(self, profile: FandomProfile | None) -> None:
         active = profile or self.container.fandom_service.active_profile() or self.container.fandom_service.ensure_default()
@@ -1406,11 +2069,6 @@ class AO3StudioShell:
         base_dialog_style = (
             wash_background(accent, 0.14)
             + f"width: 560px; max-width: 94vw; height: 85vh; max-height: calc(100vh - 24px); border: 1px solid rgba({r},{g},{b},0.24);"
-        )
-        fullscreen_dialog_style = (
-            wash_background(accent, 0.14)
-            + "width: 100vw !important; max-width: 100vw !important; height: 100vh !important; max-height: 100vh !important; "
-            + f"border-radius: 0 !important; border: 1px solid rgba({r},{g},{b},0.24);"
         )
         draft = {
             "fandom_key": "" if is_new else active.fandom_key,
@@ -1425,7 +2083,7 @@ class AO3StudioShell:
         config_state["fandom"] = "" if is_new else active.tag
         style_override = self.container.style_service.fandom_override(active.fandom_key)
         style_state = dict(style_override.settings)
-        style_enabled = {"enabled": bool(style_override.enabled)}
+        style_enabled = self.container.style_service.override_sections(style_override)
         character_draft = {"name": "", "full_name": "", "color": draft["color"], "avatar_url": "", "tag_urls": "", "notes": ""}
         initial_tab = str(self.container.preferences_service.get("fandom_dialog_tab", "Identity") or "Identity")
         if initial_tab not in {"Identity", "Style", "Config", "Characters"}:
@@ -1434,23 +2092,114 @@ class AO3StudioShell:
             "avatar_slot": None,
             "character_panel": None,
             "config_container": None,
+            "footer_left": None,
         }
         expanded_characters: set[str] = set()
         character_cleanup = {"mode": False, "armed": False, "selected": set()}
+        active_dialog_tab = {"value": initial_tab}
+        maximized = {"value": False}
 
         def collapse_character_expansions() -> None:
             if expanded_characters:
                 expanded_characters.clear()
                 render_character_panel()
 
+        def disarm_character_cleanup() -> None:
+            if character_cleanup["armed"]:
+                character_cleanup["armed"] = False
+                render_character_footer()
+
+        def dialog_background_click() -> None:
+            collapse_character_expansions()
+            disarm_character_cleanup()
+
+        def toggle_character_cleanup() -> None:
+            character_cleanup["mode"] = not bool(character_cleanup["mode"])
+            character_cleanup["armed"] = False
+            character_cleanup["selected"] = set()
+            render_character_panel()
+            render_character_footer()
+
+        def handle_character_trash() -> None:
+            if character_cleanup["armed"]:
+                delete_selected_characters()
+                return
+            character_cleanup["armed"] = True
+            render_character_footer()
+
+        def render_character_footer() -> None:
+            footer_left = refs.get("footer_left")
+            if not footer_left:
+                return
+            footer_left.clear()
+            with footer_left:
+                if active_dialog_tab["value"] != "Characters":
+                    ui.label("Changes are local until saved.").classes("text-xs italic text-gray-500")
+                    return
+                cleanup = ui.button(icon="cleaning_services").props("flat round dense")
+                cleanup.style(f"color: {'#f8fafc' if character_cleanup['mode'] else '#6b7280'} !important;")
+                cleanup.on("click.stop", lambda _=None: toggle_character_cleanup())
+                with cleanup:
+                    rich_tooltip("Cleanup mode", current_color())
+                if character_cleanup["mode"]:
+                    trash = ui.button(icon="delete").props("flat round dense")
+                    trash.style(f"color: {'#ef4444' if character_cleanup['armed'] else '#6b7280'} !important;")
+                    trash.on("click.stop", lambda _=None: handle_character_trash())
+                    with trash:
+                        rich_tooltip("Delete selected character identities", "#ef4444")
+
         def current_color() -> str:
             return str(draft.get("color") or accent or "#58a6ff")
+
+        def dialog_style_for(color: str, *, fullscreen: bool = False) -> str:
+            rr, gg, bb = rgb_from_hex(color)
+            if fullscreen:
+                dimensions = (
+                    "width: 100vw !important; max-width: 100vw !important; height: 100vh !important; max-height: 100vh !important; "
+                    "border-radius: 0 !important; "
+                )
+            else:
+                dimensions = "width: 560px; max-width: 94vw; height: 85vh; max-height: calc(100vh - 24px); "
+            return wash_background(color, 0.14) + dimensions + f"border: 1px solid rgba({rr},{gg},{bb},0.24);"
+
+        def refresh_dialog_theme() -> None:
+            color = current_color()
+            card_ref = refs.get("card")
+            if card_ref:
+                card_ref.style(replace=dialog_style_for(color, fullscreen=bool(maximized["value"])))
+            header_icon = refs.get("header_icon")
+            if header_icon:
+                header_icon.style(replace=f"color: {normalized_label_color(color)};")
+            header_title = refs.get("header_title")
+            if header_title:
+                header_title.set_text(active.display_name if not is_new else "New Fandom")
+                header_title.style(replace=glow_text(color, 4))
+            maximize_ref = refs.get("maximize_btn")
+            if maximize_ref:
+                maximize_ref.style(replace=f"color: {normalized_label_color(color)} !important; opacity: 0.78;")
+            for key in ("export_btn", "import_btn"):
+                icon_btn = refs.get(key)
+                if icon_btn:
+                    icon_btn.style(replace=f"color: {normalized_label_color(color)} !important;")
+            notes_label = refs.get("notes_label")
+            if notes_label:
+                notes_label.style(replace=glow_text(color, 3))
+            footer_save_ref = refs.get("footer_save")
+            if footer_save_ref:
+                footer_save_ref.style(replace=f"background-color: {dark_button_color(color)} !important; color: white;")
 
         def handle_tab(event) -> None:
             value = str(getattr(event, "value", None) or getattr(event, "args", None) or "Identity")
             if value in {"Identity", "Style", "Config", "Characters"}:
+                active_dialog_tab["value"] = value
                 self.container.preferences_service.set("fandom_dialog_tab", value)
+                if value != "Characters":
+                    character_cleanup["mode"] = False
+                    character_cleanup["armed"] = False
+                    character_cleanup["selected"] = set()
                 collapse_character_expansions()
+                render_character_panel()
+                render_character_footer()
 
         def close_dialog() -> None:
             ui.run_javascript("if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); }")
@@ -1489,22 +2238,101 @@ class AO3StudioShell:
             is_new = False
             accent = saved.color
             draft["fandom_key"] = saved.fandom_key
+            draft["tag"] = saved.tag
             draft["display_name"] = saved.display_name
+            draft["color"] = saved.color
             draft["avatar_url"] = saved.avatar_url or ""
             self.container.preferences_service.set("active_page", self.page)
             self._invalidate_browse_page_model()
             self._notify("Fandom saved.", "positive")
+            self._update_fandom_row_in_place(saved)
+            refresh_dialog_theme()
             render_avatar_slot()
             render_config_controls()
             render_character_panel()
+            render_character_footer()
 
-        def save_fandom_style(state: dict[str, Any]) -> None:
+        def save_fandom_style(state: dict[str, Any], *, notify: bool = True, refresh_center: bool = True) -> None:
             if is_new:
-                self._notify("Save the fandom before enabling a style override.", "warning")
+                if notify:
+                    self._notify("Save the fandom before enabling a style override.", "warning")
                 return
-            self.container.style_service.save_fandom_override(active.fandom_key, bool(style_enabled["enabled"]), state)
+            state[STYLE_OVERRIDE_SECTIONS_KEY] = dict(style_enabled)
+            saved_override = self.container.style_service.save_fandom_override(active.fandom_key, any(style_enabled.values()), state)
+            style_enabled.clear()
+            style_enabled.update(self.container.style_service.override_sections(saved_override))
+            style_state.clear()
+            style_state.update(saved_override.settings)
             self._invalidate_browse_page_model()
-            self._notify("Fandom style saved.", "positive")
+            if refresh_center and self.page in {"Browse", "Works", "Read", "Queue", "Evaluated"}:
+                self._render_center()
+            if notify:
+                self._notify("Fandom style saved.", "positive")
+
+        def export_current_fandom() -> None:
+            if is_new:
+                self._notify("Save this fandom before exporting a backup.", "warning")
+                return
+            self._download_fandom_backup(active.fandom_key)
+
+        def open_fandom_backup_import_dialog() -> None:
+            nonlocal active, is_new, accent
+            import_dialog = ui.dialog()
+            import_dialog.on("hide", import_dialog.delete)
+
+            async def handle_import_upload(event: events.UploadEventArguments) -> None:
+                nonlocal active, is_new, accent
+                try:
+                    content = await event.file.read()
+                    imported = self.container.fandom_service.import_fandom_backup(content)
+                except Exception as exc:  # noqa: BLE001
+                    self._notify(f"Fandom backup import failed: {exc}", "negative")
+                    return
+                active = imported
+                is_new = False
+                accent = imported.color
+                draft.update(
+                    {
+                        "fandom_key": imported.fandom_key,
+                        "tag": imported.tag,
+                        "display_name": imported.display_name,
+                        "color": imported.color,
+                        "avatar_url": imported.avatar_url or "",
+                        "notes": imported.notes or "",
+                    }
+                )
+                config_state.clear()
+                config_state.update(default_fandom_filter(imported.tag))
+                config_state.update(imported.default_filter or {})
+                config_state["fandom"] = imported.tag
+                self._invalidate_browse_page_model()
+                import_dialog.close()
+                self._render_left()
+                refresh_dialog_theme()
+                render_avatar_slot()
+                render_config_controls()
+                render_character_panel()
+                render_character_footer()
+                if self.page in {"Browse", "Works", "Read", "Queue", "Evaluated"}:
+                    self._render_center()
+                self._notify(f"Imported backup for {imported.display_name}.", "positive")
+
+            with import_dialog, ui.card().classes("w-[460px] max-w-[94vw] p-0 gap-0 overflow-hidden").style(wash_background(current_color(), 0.14)):
+                with ui.row().classes("w-full items-center justify-between p-3 border-b border-gray-700"):
+                    ui.label("Import Fandom Backup").classes("text-lg font-bold").style(glow_text(current_color(), 4))
+                    ui.button(icon="close", on_click=import_dialog.close).props("flat round dense color=white")
+                with ui.column().classes("w-full gap-3 p-3"):
+                    ui.label("Drop an AO3 Studio fandom backup zip.").classes("text-sm text-gray-400")
+                    ui.upload(
+                        label="Drop .ao3fandom.zip Here",
+                        auto_upload=True,
+                        max_files=1,
+                        on_upload=handle_import_upload,
+                    ).props('accept=".zip,.ao3fandom.zip" flat bordered').classes("w-full")
+            import_dialog.open()
+
+        def preview_fandom_style(state: dict[str, Any]) -> None:
+            save_fandom_style(state, notify=False, refresh_center=True)
 
         def render_avatar_slot() -> None:
             slot = refs.get("avatar_slot")
@@ -1609,16 +2437,53 @@ class AO3StudioShell:
                     clear_btn = ui.button("Clear", icon="backspace", on_click=clear_defaults).props("dense flat")
                     clear_btn.style("color: #94a3b8 !important;")
 
-        def use_suggestion(suggestion, draft: dict[str, Any] | None = None) -> None:
+        def use_suggestion(suggestion, draft: dict[str, Any] | None = None, character_id: str | None = None) -> None:
             target = draft or character_draft
             source_label = suggestion.tag_url or suggestion.tag_text
             short_name, full_name = _character_names_from_ao3_label(source_label)
             target["name"] = short_name or suggestion.tag_text
             target["full_name"] = full_name or suggestion.tag_text
             target["tag_urls"] = _canonical_ao3_character_tag_url(source_label)
-            render_character_panel()
+            if character_id:
+                save_character_from_draft(target, character_id, notify=False, rerender=True)
+            else:
+                render_character_panel()
 
-        def save_character_from_draft(draft: dict[str, Any], character_id: str | None = None) -> None:
+        def input_event_text(event, fallback: Any = "") -> str:
+            if event is not None:
+                if hasattr(event, "args"):
+                    args = getattr(event, "args")
+                    if args is None:
+                        return ""
+                    if isinstance(args, dict):
+                        for key in ("value", "modelValue", "model-value", "text"):
+                            if key in args:
+                                return "" if args[key] is None else str(args[key])
+                        return ""
+                    return str(args)
+                if hasattr(event, "value"):
+                    value = getattr(event, "value")
+                    return "" if value is None else str(value)
+            return str(fallback or "")
+
+        def character_tag_suggestion_js() -> str:
+            return (
+                "(event) => { "
+                "const value = String(event?.target?.value ?? event?.detail?.value ?? ''); "
+                "const shell = event?.target?.closest('.character-tag-suggestion-shell'); "
+                "const row = shell?.querySelector('.character-tag-suggestions'); "
+                "if (row && !value.trim()) row.classList.add('hidden'); "
+                "emit(value); "
+                "}"
+            )
+
+        def save_character_from_draft(
+            draft: dict[str, Any],
+            character_id: str | None = None,
+            *,
+            notify: bool = True,
+            rerender: bool = True,
+        ) -> None:
             if is_new:
                 self._notify("Save the fandom before adding character identities.", "warning")
                 return
@@ -1640,11 +2505,157 @@ class AO3StudioShell:
                 avatar_url=str(draft.get("avatar_url") or ""),
                 tag_urls=[canonical_tag_url] if canonical_tag_url else [],
                 notes=str(draft.get("notes") or ""),
+                reader_style=dict(draft.get("reader_style") or {}),
             )
-            self._notify(result.message, "positive" if result.ok else "warning")
+            if notify:
+                self._notify(result.message, "positive" if result.ok else "warning")
             if result.ok and character_id is None:
                 character_draft.update({"name": "", "full_name": "", "tag_urls": "", "notes": ""})
+            if rerender:
+                render_character_panel()
+
+        def autosave_character_draft(draft: dict[str, Any], character_id: str) -> None:
+            save_character_from_draft(draft, character_id, notify=False, rerender=False)
+
+        def character_expanded_style(color: str) -> str:
+            cr, cg, cb = rgb_from_hex(color)
+            return (
+                f"border: 1px solid rgba({cr},{cg},{cb},0.46); "
+                f"background: rgba({cr},{cg},{cb},0.11); "
+                f"box-shadow: 0 0 16px rgba({cr},{cg},{cb},0.12);"
+            )
+
+        def character_font_icon_style(color: str, active: bool) -> str:
+            label_color = normalized_label_color(color)
+            return (
+                f"color: {label_color if active else '#64748b'} !important; "
+                f"--character-font-color: {label_color};"
+            )
+
+        def update_character_color_live(value: Any, draft: dict[str, Any], character_id: str, live_refs: dict[str, Any]) -> None:
+            color = self._normalize_hex(str(value or ""))
+            if not color:
+                return
+            draft["color"] = color
+            expanded_ref = live_refs.get("expanded")
+            if expanded_ref:
+                expanded_ref.style(replace=character_expanded_style(color))
+            pill_ref = live_refs.get("pill")
+            if pill_ref:
+                pill_ref.style(replace=self._filter_pill_style(color, True))
+            self._restyle_avatar_refs(live_refs.get("avatar"), color, str(draft.get("name") or ""))
+            font_icon_ref = live_refs.get("font_icon")
+            if font_icon_ref:
+                font_active = bool(draft.get("reader_style", {}).get("custom_font_enabled") or draft.get("reader_style", {}).get("font_size_enabled"))
+                font_icon_ref.style(replace=character_font_icon_style(color, font_active))
+            autosave_character_draft(draft, character_id)
+            self._restyle_avatar_refs(live_refs.get("pill_avatar"), color, str(draft.get("name") or ""))
+            if self.page == "Read":
+                self._render_right()
+                self._render_center()
+
+        def save_character_style(character: CharacterProfile, reader_style: dict[str, Any], *, notify: bool = True) -> None:
+            result = self.container.fandom_service.save_character(
+                fandom_key=character.fandom_key,
+                character_id=character.id,
+                name=character.name,
+                full_name=character.full_name or character.name,
+                color=character.color,
+                avatar_url=character.avatar_url or "",
+                tag_urls=character.tag_urls,
+                notes=character.notes or "",
+                reader_style=reader_style,
+            )
+            if notify:
+                self._notify(result.message, "positive" if result.ok else "warning")
             render_character_panel()
+
+        def open_character_font_dialog(character: CharacterProfile) -> None:
+            reader_style = normalize_character_reader_style(character.reader_style)
+            draft = dict(reader_style)
+            accent_color = character.color
+            refs_font: dict[str, Any] = {}
+
+            def set_font(font_value: str) -> None:
+                draft["font_family"] = font_value
+                render_font_pills()
+
+            def render_font_pills() -> None:
+                container = refs_font.get("fonts")
+                if not container:
+                    return
+                container.clear()
+                current = str(draft.get("font_family") or DEFAULT_READER_STYLE["preview_font_family"])
+                enabled = bool(draft.get("custom_font_enabled"))
+                with container:
+                    for _category, data in FONT_CATEGORIES.items():
+                        for font_value, full_name in data["fonts"].items():
+                            selected = font_value == current
+                            color = self._font_color(font_value)
+                            r, g, b = rgb_from_hex(color)
+                            bg = "0.25" if selected else "0.08"
+                            border = "0.50" if selected else "0.15"
+                            label = self._font_pill_label(full_name)
+                            pill = ui.button(label, on_click=lambda _=None, f=font_value: set_font(f)).props("dense flat rounded no-caps")
+                            pill.classes("px-2 py-1")
+                            pill.style(
+                                f"background: rgba({r},{g},{b},{bg}) !important; border: 1px solid rgba({r},{g},{b},{border}); "
+                                f"color: {color} !important; font-family: {font_value}; {self._font_variation_css(font_value)} "
+                                f"text-shadow: {'0 0 6px ' + color if selected else 'none'}; {'opacity: 0.42;' if not enabled else ''}"
+                            )
+                            with pill:
+                                ui.tooltip(full_name).classes("text-sm").style(
+                                    f"font-family: {font_value}; {self._font_variation_css(font_value)} "
+                                    f"color: {color}; background: linear-gradient(160deg, rgba({r},{g},{b},0.15), rgba({r},{g},{b},0.08)), #0d1117 !important; "
+                                    f"border: 1px solid rgba({r},{g},{b},0.30);"
+                                )
+
+            def save_dialog() -> None:
+                normalized = normalize_character_reader_style(draft)
+                save_character_style(character, normalized, notify=False)
+                if self.page == "Read":
+                    self._render_center()
+                self._notify("Character reader font saved.", "positive")
+
+            with self.root:
+                dialog = ui.dialog()
+                dialog.on("hide", dialog.delete)
+            cr, cg, cb = rgb_from_hex(accent_color)
+            reader_font_dialog_style = (
+                wash_background(accent_color, 0.14)
+                + f"width: 560px; max-width: 94vw; height: 85vh; max-height: calc(100vh - 24px); border: 1px solid rgba({cr},{cg},{cb},0.26);"
+            )
+            with dialog, ui.card().classes("flex flex-col p-0 gap-0 overflow-hidden").style(reader_font_dialog_style):
+                with ui.row().classes("w-full items-center justify-between p-3 border-b border-gray-700 shrink-0").style(
+                    "background: rgba(22, 27, 34, 0.75); backdrop-filter: blur(8px);"
+                ):
+                    ui.label(f"{character.name} Reader Font").classes("text-lg font-bold").style(glow_text(accent_color, 4))
+                    ui.button(icon="close", on_click=dialog.close).props("flat round dense color=white")
+                with ui.scroll_area().classes("w-full flex-grow min-h-0"):
+                    with ui.column().classes("w-full gap-3 p-3"):
+                        with ui.element("div").classes("soft-panel w-full p-3"):
+                            with ui.row().classes("w-full items-center justify-between"):
+                                ui.label("Custom Font").classes("text-sm font-bold").style(glow_text(accent_color, 3))
+                                font_switch = ui.switch(value=draft["custom_font_enabled"]).bind_value(draft, "custom_font_enabled").props("dense color=primary")
+                                font_switch.on("update:model-value", lambda _=None: render_font_pills())
+                            refs_font["fonts"] = ui.row().classes("w-full gap-2 flex-wrap mt-2")
+                            render_font_pills()
+                        with ui.element("div").classes("soft-panel w-full p-3"):
+                            with ui.row().classes("w-full items-center justify-between gap-2"):
+                                ui.label("Starting Font Size").classes("text-sm font-bold").style(glow_text(accent_color, 3))
+                                ui.switch(value=draft["font_size_enabled"]).bind_value(draft, "font_size_enabled").props("dense color=primary")
+                            ui.number("Character Font Size", value=draft.get("font_size", 16.5), min=8, max=48, step=0.5).bind_value(
+                                draft,
+                                "font_size",
+                            ).props("dark outlined dense").classes("w-full mt-2")
+                with ui.row().classes("w-full items-center justify-between p-3 border-t border-gray-700 shrink-0").style(
+                    "background: rgba(13, 17, 23, 0.78);"
+                ):
+                    ui.label("Disabled toggles keep this as passive character info.").classes("text-xs italic text-gray-500")
+                    ui.button("Save", icon="save", on_click=save_dialog).style(
+                        f"background-color: {dark_button_color(accent_color)} !important; color: white;"
+                    )
+            dialog.open()
 
         def delete_selected_characters() -> None:
             for character_id in list(character_cleanup["selected"]):
@@ -1653,6 +2664,7 @@ class AO3StudioShell:
             character_cleanup["armed"] = False
             character_cleanup["mode"] = False
             render_character_panel()
+            render_character_footer()
 
         async def refresh_catalog_from_dialog() -> None:
             if is_new:
@@ -1669,33 +2681,11 @@ class AO3StudioShell:
                 if is_new:
                     ui.label("Save the fandom before adding character identities.").classes("text-sm text-gray-500")
                     return
-                with ui.row().classes("w-full items-center justify-between"):
-                    with ui.column().classes("gap-0"):
-                        count = self.container.fandom_service.tag_catalog_count(active.fandom_key)
-                        ui.label(f"AO3 character tag suggestions cached: {count:,}").classes("text-xs text-gray-500")
-                    with ui.row().classes("items-center gap-1"):
-                        cleanup = ui.button(icon="cleaning_services").props("flat round dense")
-                        cleanup.style(f"color: {'#ef4444' if character_cleanup['mode'] else normalized_label_color(current_color())} !important;")
-                        cleanup.on("click.stop", lambda _=None: (character_cleanup.update({"mode": not character_cleanup["mode"], "armed": False, "selected": set()}), render_character_panel()))
-                        with cleanup:
-                            rich_tooltip("Cleanup mode", current_color())
-                        trash = ui.button(icon="delete").props("flat round dense")
-                        trash.style(f"color: {'#ef4444' if character_cleanup['armed'] else '#6b7280'} !important;")
-                        trash.classes(remove="opacity-0 pointer-events-none" if character_cleanup["mode"] else "")
-                        if not character_cleanup["mode"]:
-                            trash.classes(add="opacity-0 pointer-events-none")
-                        trash.on("click.stop", lambda _=None: delete_selected_characters() if character_cleanup["armed"] else (character_cleanup.update({"armed": True}), render_character_panel()))
-                        with trash:
-                            rich_tooltip("Delete selected character identities", "#ef4444")
-                        refresh = ui.button(icon="cloud_sync").props("flat round dense")
-                        refresh.style(f"color: {normalized_label_color(current_color())} !important;")
-                        refresh.on("click.stop", lambda _=None: refresh_catalog_from_dialog())
-                        with refresh:
-                            rich_tooltip("Refresh AO3 tags for this fandom", current_color())
                 characters = self.container.fandom_service.list_characters(active.fandom_key)
                 if not characters:
                     ui.label("No character colors yet.").classes("text-sm text-gray-500")
                 else:
+                    character_live_refs: dict[str, dict[str, Any]] = {}
                     with ui.row().classes("w-full gap-1 flex-wrap items-center reader-character-pill-row"):
                         for character in characters:
                             display_name, _ = _character_profile_display_names(character)
@@ -1706,6 +2696,7 @@ class AO3StudioShell:
                             pill = ui.element("button").props("type=button").classes(
                                 "work-tag-pill browse-tag-pill reader-character-pill character-profile-pill text-[11px]"
                             )
+                            character_live_refs[character.id] = {"pill": pill}
                             pill.style(self._filter_pill_style(color, selected))
                             pill.on(
                                 "click",
@@ -1719,19 +2710,21 @@ class AO3StudioShell:
                                 js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
                             )
                             with pill:
-                                self._avatar_image(character.avatar_url, display_name, character.color, "22px", "200px")
+                                character_live_refs[character.id]["pill_avatar"] = self._avatar_image(
+                                    character.avatar_url,
+                                    display_name,
+                                    character.color,
+                                    "22px",
+                                    "200px",
+                                )
                                 ui.label(display_name).classes("browse-tag-pill-label reader-character-pill-label")
                                 rich_tooltip("Cleanup selected" if cleanup_selected and character_cleanup["mode"] else "Click to edit", color)
                     for character in characters:
                         if character.id not in expanded_characters:
                             continue
                         display_name, display_full_name = _character_profile_display_names(character)
-                        cr, cg, cb = rgb_from_hex(character.color)
-                        expanded_style = (
-                            f"border: 1px solid rgba({cr},{cg},{cb},0.46); "
-                            f"background: rgba({cr},{cg},{cb},0.11); "
-                            f"box-shadow: 0 0 16px rgba({cr},{cg},{cb},0.12);"
-                        )
+                        live_refs = character_live_refs.setdefault(character.id, {})
+                        expanded_style = character_expanded_style(character.color)
                         draft = {
                             "name": display_name,
                             "full_name": display_full_name,
@@ -1739,13 +2732,15 @@ class AO3StudioShell:
                             "avatar_url": character.avatar_url or "",
                             "tag_urls": _canonical_ao3_character_tag_url((character.tag_urls or [""])[0] or display_full_name or display_name),
                             "notes": character.notes or "",
+                            "reader_style": normalize_character_reader_style(character.reader_style),
                         }
                         with ui.element("div").classes("soft-panel w-full p-2 character-profile-expanded").style(expanded_style).on(
                             "click.stop",
                             lambda _=None: None,
-                        ):
+                        ) as expanded_panel:
+                            live_refs["expanded"] = expanded_panel
                             with ui.row().classes("w-full items-center gap-2"):
-                                self._character_avatar_button(
+                                live_refs["avatar"] = self._character_avatar_button(
                                     character.id,
                                     display_name,
                                     character.avatar_url,
@@ -1753,35 +2748,61 @@ class AO3StudioShell:
                                     render_character_panel,
                                     active.fandom_key,
                                 )
-                                ui.input("Name", value=draft["name"]).bind_value(draft, "name").props(
+                                name_field = ui.input("Name", value=draft["name"]).bind_value(draft, "name").props(
                                     "dark outlined dense"
                                 ).classes("w-32")
-                                ui.input("Full Name", value=draft["full_name"]).bind_value(draft, "full_name").props(
+                                name_field.on("blur", lambda _=None, d=draft, cid=character.id: autosave_character_draft(d, cid))
+                                full_name_field = ui.input("Full Name", value=draft["full_name"]).bind_value(draft, "full_name").props(
                                     "dark outlined dense"
                                 ).classes("flex-grow")
-                                ui.color_input("Color", value=draft["color"]).bind_value(draft, "color").props("dark outlined dense").classes("w-32")
-                            tag_input = ui.input("Canonical AO3 character tag URL", value=draft["tag_urls"]).bind_value(draft, "tag_urls").props(
-                                "dark outlined dense"
-                            ).classes("w-full")
-                            ui.textarea("Notes", value=draft["notes"]).bind_value(draft, "notes").props("dark outlined dense rows=2").classes("w-full")
-                            suggestions_row = ui.row().classes("w-full gap-1 flex-wrap")
+                                full_name_field.on("blur", lambda _=None, d=draft, cid=character.id: autosave_character_draft(d, cid))
+                                color_field = ui.color_input(
+                                    "Color",
+                                    value=draft["color"],
+                                    on_change=lambda event, d=draft, cid=character.id, lr=live_refs: update_character_color_live(
+                                        getattr(event, "value", None),
+                                        d,
+                                        cid,
+                                        lr,
+                                    ),
+                                ).bind_value(draft, "color").props("dark outlined dense").classes("w-32")
+                                font_style_active = bool(draft["reader_style"].get("custom_font_enabled") or draft["reader_style"].get("font_size_enabled"))
+                                font_icon = ui.icon("text_fields", size="sm").classes("character-font-icon cursor-pointer px-1")
+                                live_refs["font_icon"] = font_icon
+                                font_icon.style(character_font_icon_style(character.color, font_style_active))
+                                font_icon.on("click.stop", lambda _=None, c=character: open_character_font_dialog(c))
+                                with font_icon:
+                                    rich_tooltip("Character reader font", character.color)
+                            with ui.element("div").classes("w-full character-tag-suggestion-shell"):
+                                tag_input = ui.input("Canonical AO3 character tag URL", value=draft["tag_urls"]).bind_value(draft, "tag_urls").props(
+                                    "dark outlined dense"
+                                ).classes("w-full")
+                                tag_input.on("blur", lambda _=None, d=draft, cid=character.id: autosave_character_draft(d, cid))
+                                suggestions_row = ui.row().classes("w-full gap-1 flex-wrap character-tag-suggestions hidden")
 
-                            def render_edit_suggestions(ch_draft=draft, row=suggestions_row, char_color=character.color) -> None:
+                            def render_edit_suggestions(event=None, ch_draft=draft, row=suggestions_row, char_color=character.color) -> None:
                                 row.clear()
-                                query = str(ch_draft.get("tag_urls") or ch_draft.get("full_name") or ch_draft.get("name") or "")
+                                raw_query = input_event_text(event, ch_draft.get("tag_urls") or "")
+                                if event is not None:
+                                    ch_draft["tag_urls"] = raw_query
+                                query = raw_query.strip()
+                                if not query:
+                                    row.classes(add="hidden")
+                                    return
                                 suggestions = _canonical_character_suggestions(
                                     self.container.fandom_service.tag_suggestions(active.fandom_key, query, 24, category="character"),
                                     query,
                                 )[:12]
+                                if not suggestions:
+                                    row.classes(add="hidden")
+                                    return
+                                row.classes(remove="hidden")
                                 with row:
-                                    if not suggestions:
-                                        ui.label("Refresh AO3 tag catalog for character-tag suggestions.").classes("text-[11px] text-gray-500")
-                                        return
                                     for suggestion in suggestions:
                                         suggestion_label = _ao3_character_tag_label(suggestion.tag_url or suggestion.tag_text)
                                         pill = ui.button(
                                             suggestion_label,
-                                            on_click=lambda _=None, s=suggestion, d=ch_draft: use_suggestion(s, d),
+                                            on_click=lambda _=None, s=suggestion, d=ch_draft, cid=character.id: use_suggestion(s, d, cid),
                                         ).props("dense rounded flat")
                                         pill.classes("max-w-full")
                                         pill.style(
@@ -1791,15 +2812,8 @@ class AO3StudioShell:
                                         with pill:
                                             rich_tooltip("character", char_color)
 
-                            tag_input.on("update:model-value", lambda _=None: render_edit_suggestions())
-                            render_edit_suggestions()
-                            with ui.row().classes("w-full justify-end"):
-                                save_btn = ui.button(
-                                    "Save",
-                                    icon="save",
-                                    on_click=lambda _=None, d=draft, cid=character.id: save_character_from_draft(d, cid),
-                                ).props("dense")
-                                save_btn.style(f"background-color: {dark_button_color(character.color)} !important; color: white;")
+                            tag_input.on("keyup", lambda event=None: render_edit_suggestions(event), js_handler=character_tag_suggestion_js())
+                            tag_input.on("input", lambda event=None: render_edit_suggestions(event), js_handler=character_tag_suggestion_js())
                 ui.separator().classes("bg-gray-800")
                 with ui.row().classes("w-full gap-2 items-end"):
                     name_input = ui.input("Name", value=character_draft["name"]).bind_value(character_draft, "name").props(
@@ -1808,24 +2822,40 @@ class AO3StudioShell:
                     full_name_input = ui.input("Full Name", value=character_draft["full_name"]).bind_value(character_draft, "full_name").props(
                         "dark outlined dense"
                     ).classes("flex-grow")
+                with ui.row().classes("w-full gap-2 items-end"):
                     ui.color_input("Color", value=character_draft["color"]).bind_value(character_draft, "color").props("dark outlined dense").classes("w-32")
-                tag_input = ui.input("Canonical AO3 character tag URL", value=character_draft["tag_urls"]).bind_value(
-                    character_draft,
-                    "tag_urls",
-                ).props("dark outlined dense").classes("w-full")
-                suggestions_row = ui.row().classes("w-full gap-1 flex-wrap")
+                    refresh = ui.button(icon="cloud_sync").props("flat round dense")
+                    refresh.style(f"color: {normalized_label_color(current_color())} !important;")
+                    refresh.on("click.stop", lambda _=None: refresh_catalog_from_dialog())
+                    with refresh:
+                        rich_tooltip("Refresh AO3 tags for this fandom", current_color())
+                    add_btn = ui.button("Add Character", icon="add", on_click=lambda: save_character_from_draft(character_draft))
+                    add_btn.style(f"background-color: {dark_button_color(current_color())} !important; color: white;")
+                with ui.element("div").classes("w-full character-tag-suggestion-shell"):
+                    tag_input = ui.input("Canonical AO3 character tag URL", value=character_draft["tag_urls"]).bind_value(
+                        character_draft,
+                        "tag_urls",
+                    ).props("dark outlined dense").classes("w-full")
+                    suggestions_row = ui.row().classes("w-full gap-1 flex-wrap character-tag-suggestions hidden")
 
-                def render_suggestions() -> None:
+                def render_suggestions(event=None) -> None:
                     suggestions_row.clear()
-                    query = str(character_draft["tag_urls"] or character_draft["full_name"] or character_draft["name"] or "")
+                    raw_query = input_event_text(event, character_draft["tag_urls"])
+                    if event is not None:
+                        character_draft["tag_urls"] = raw_query
+                    query = raw_query.strip()
+                    if not query:
+                        suggestions_row.classes(add="hidden")
+                        return
                     suggestions = _canonical_character_suggestions(
                         self.container.fandom_service.tag_suggestions(active.fandom_key, query, 28, category="character"),
                         query,
                     )[:14]
+                    if not suggestions:
+                        suggestions_row.classes(add="hidden")
+                        return
+                    suggestions_row.classes(remove="hidden")
                     with suggestions_row:
-                        if not suggestions:
-                            ui.label("Refresh AO3 tag catalog for live suggestions.").classes("text-[11px] text-gray-500")
-                            return
                         for suggestion in suggestions:
                             suggestion_label = _ao3_character_tag_label(suggestion.tag_url or suggestion.tag_text)
                             pill = ui.button(
@@ -1840,44 +2870,47 @@ class AO3StudioShell:
                             with pill:
                                 rich_tooltip(suggestion.category.replace("_", " "), current_color())
 
-                name_input.on("update:model-value", lambda _=None: render_suggestions())
-                full_name_input.on("update:model-value", lambda _=None: render_suggestions())
-                tag_input.on("update:model-value", lambda _=None: render_suggestions())
-                render_suggestions()
-                add_btn = ui.button("Add Character", icon="add", on_click=lambda: save_character_from_draft(character_draft))
-                add_btn.style(f"background-color: {dark_button_color(current_color())} !important; color: white;")
+                tag_input.on("keyup", lambda event=None: render_suggestions(event), js_handler=character_tag_suggestion_js())
+                tag_input.on("input", lambda event=None: render_suggestions(event), js_handler=character_tag_suggestion_js())
 
-        dialog = ui.dialog()
+        if self.root:
+            with self.root:
+                dialog = ui.dialog()
+        else:
+            dialog = ui.dialog()
         dialog.on("hide", dialog.delete)
         with dialog, ui.card().classes("flex flex-col p-0 gap-0 overflow-hidden").style(base_dialog_style) as card:
+            refs["card"] = card
             header_row = ui.row().classes("w-full items-center justify-between p-4 border-b border-gray-700 shrink-0").style(
                 "background: rgba(22, 27, 34, 0.75); backdrop-filter: blur(8px);"
             )
-            header_row.on("click", lambda _=None: collapse_character_expansions())
+            header_row.on("click", lambda _=None: dialog_background_click())
             with header_row:
                 with ui.row().classes("items-center gap-2 min-w-0"):
-                    ui.icon("collections_bookmark", size="sm").style(f"color: {normalized_label_color(accent)};")
+                    refs["header_icon"] = ui.icon("collections_bookmark", size="sm").style(f"color: {normalized_label_color(accent)};")
                     ui.label("Edit Fandom:").classes("text-lg font-bold text-gray-300")
-                    ui.label(active.display_name if not is_new else "New Fandom").classes("text-lg font-bold truncate min-w-0").style(
+                    refs["header_title"] = ui.label(active.display_name if not is_new else "New Fandom").classes(
+                        "text-lg font-bold truncate min-w-0"
+                    ).style(
                         glow_text(accent, 4)
                     )
-                    maximized = {"value": False}
 
                     def toggle_maximize() -> None:
                         maximized["value"] = not maximized["value"]
                         if maximized["value"]:
                             maximize_btn._props["icon"] = "fullscreen_exit"
-                            card.style(replace=fullscreen_dialog_style)
+                            card.style(replace=dialog_style_for(current_color(), fullscreen=True))
                             dialog.props("maximized")
                             ui.run_javascript("if (!document.fullscreenElement) { document.documentElement.requestFullscreen().catch(() => {}); }")
                         else:
                             maximize_btn._props["icon"] = "fullscreen"
-                            card.style(replace=base_dialog_style)
+                            card.style(replace=dialog_style_for(current_color(), fullscreen=False))
                             dialog.props(remove="maximized")
                             ui.run_javascript("if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); }")
                         maximize_btn.update()
 
                     maximize_btn = ui.button(icon="fullscreen", on_click=toggle_maximize).props("flat round dense size=sm")
+                    refs["maximize_btn"] = maximize_btn
                     maximize_btn.style(f"color: {normalized_label_color(accent)} !important; opacity: 0.78;")
                     with maximize_btn:
                         rich_tooltip("Toggle fullscreen", accent)
@@ -1914,11 +2947,23 @@ class AO3StudioShell:
                             with ui.row().classes("w-full items-center gap-2"):
                                 color_btn = ui.color_input("Theme color", value=draft["color"]).bind_value(draft, "color").props(
                                     "dark outlined dense"
-                                ).classes("w-full")
+                                ).classes("flex-grow")
                                 with color_btn:
                                     rich_tooltip("Theme color", str(draft["color"]))
+                                export_btn = ui.button(icon="archive").props("flat round dense")
+                                refs["export_btn"] = export_btn
+                                export_btn.style(f"color: {normalized_label_color(current_color())} !important;")
+                                export_btn.on("click.stop", lambda _=None: export_current_fandom())
+                                with export_btn:
+                                    rich_tooltip("Export portable fandom backup", current_color())
+                                import_btn = ui.button(icon="upload_file").props("flat round dense")
+                                refs["import_btn"] = import_btn
+                                import_btn.style(f"color: {normalized_label_color(current_color())} !important;")
+                                import_btn.on("click.stop", lambda _=None: open_fandom_backup_import_dialog())
+                                with import_btn:
+                                    rich_tooltip("Import portable fandom backup", current_color())
                             ui.separator().classes("bg-gray-800")
-                            ui.label("Fandom Notes").classes("text-sm font-bold").style(glow_text(str(draft["color"]), 3))
+                            refs["notes_label"] = ui.label("Fandom Notes").classes("text-sm font-bold").style(glow_text(str(draft["color"]), 3))
                             ui.textarea(value=draft["notes"]).bind_value(draft, "notes").props("dark outlined rows=8").classes("w-full")
                 with ui.tab_panel(style_tab).classes("w-full h-full p-0"):
                     with ui.scroll_area().classes("w-full h-full px-4 py-4"):
@@ -1927,6 +2972,7 @@ class AO3StudioShell:
                             accent=current_color(),
                             save_handler=save_fandom_style,
                             enabled_state=style_enabled,
+                            live_update_handler=preview_fandom_style,
                             show_thresholds=False,
                         )
                 with ui.tab_panel(config_tab).classes("w-full h-full p-0"):
@@ -1937,7 +2983,7 @@ class AO3StudioShell:
                     character_scroll = ui.scroll_area().classes("w-full h-full px-4 py-4")
                     character_scroll.on(
                         "click",
-                        lambda _=None: collapse_character_expansions(),
+                        lambda _=None: dialog_background_click(),
                         js_handler=(
                             "(event) => { "
                             "if (event.target.closest('.character-profile-expanded, .character-profile-pill, "
@@ -1955,7 +3001,7 @@ class AO3StudioShell:
             )
             footer_row.on(
                 "click",
-                lambda _=None: collapse_character_expansions(),
+                lambda _=None: dialog_background_click(),
                 js_handler=(
                     "(event) => { "
                     "if (event.target.closest('.q-btn, button, input, textarea, [role=\"button\"]')) return; "
@@ -1964,8 +3010,10 @@ class AO3StudioShell:
                 ),
             )
             with footer_row:
-                ui.label("Changes are local until saved.").classes("text-xs italic text-gray-500")
+                refs["footer_left"] = ui.row().classes("items-center gap-1 min-w-0")
+                render_character_footer()
                 footer_save = ui.button("Save", icon="save")
+                refs["footer_save"] = footer_save
                 footer_save.on("click.stop", lambda _=None: save_fandom())
                 footer_save.style(
                     f"background-color: {dark_button_color(accent)} !important; color: white;"
@@ -2111,6 +3159,7 @@ class AO3StudioShell:
                 avatar_url=str(result["avatar_url"]),
                 tag_urls=character.tag_urls,
                 notes=character.notes or "",
+                reader_style=character.reader_style,
             )
             self._notify("Character avatar uploaded.", "positive")
             dialog.close()
@@ -3375,6 +4424,53 @@ class AO3StudioShell:
     def _reader_pov_sticky_enabled(self, work_id: str) -> bool:
         return bool(self.container.preferences_service.get(self._reader_pov_sticky_key(work_id), False))
 
+    def _reader_context(self) -> tuple[FandomProfile, Work | None, int, Any | None, list[CharacterProfile]]:
+        active = self._active_fandom()
+        work_id = str(self.container.preferences_service.get("reader_work_id", "") or self.selected_work_id or "")
+        if not work_id:
+            return active, None, 1, None, []
+        result = self.container.reader_service.open_work(work_id, auto_download=False)
+        if not result.work:
+            return active, None, 1, None, []
+        chapter_index = max(1, int(result.active_chapter_index or 1))
+        chapter = result.chapters[chapter_index - 1] if result.chapters and chapter_index <= len(result.chapters) else None
+        characters = self.container.fandom_service.list_characters(active.fandom_key)
+        return active, result.work, chapter_index, chapter, characters
+
+    def _adjust_selected_character_font_size(self, active: FandomProfile, step: int) -> bool:
+        _active, work, chapter_index, chapter, characters = self._reader_context()
+        if not work or self._reader_no_pov_enabled(work.work_id):
+            return False
+        character_by_id = {character.id: character for character in characters}
+        selected_id = str(self.container.preferences_service.get(self._reader_selected_character_key(work.work_id, chapter_index), "") or "")
+        if not selected_id and self._reader_pov_sticky_enabled(work.work_id):
+            selected_id = self._reader_timeline_character_id(work.work_id, chapter_index)
+        character = character_by_id.get(selected_id)
+        if not character:
+            return False
+        reader_style = normalize_character_reader_style(character.reader_style)
+        if not reader_style.get("font_size_enabled"):
+            return False
+        effective = self.container.style_service.effective_settings(active.fandom_key)
+        step_size = float(effective.get("font_wheel_step_px") or 0.5)
+        next_size = max(8.0, min(48.0, float(reader_style.get("font_size") or effective.get("reader_font_size") or 16.5) + (step_size * step)))
+        reader_style["font_size"] = next_size
+        self._save_character_reader_style(character, reader_style)
+        return True
+
+    def _save_character_reader_style(self, character: CharacterProfile, reader_style: dict[str, Any]) -> ServiceResult:
+        return self.container.fandom_service.save_character(
+            fandom_key=character.fandom_key,
+            character_id=character.id,
+            name=character.name,
+            full_name=character.full_name or character.name,
+            color=character.color,
+            avatar_url=character.avatar_url or "",
+            tag_urls=character.tag_urls,
+            notes=character.notes or "",
+            reader_style=reader_style,
+        )
+
     def _reader_character_pool_reset(self, work_id: str, chapter_index: int) -> bool:
         return bool(self.container.preferences_service.get(self._reader_character_pool_reset_key(work_id, chapter_index), False))
 
@@ -3689,6 +4785,7 @@ class AO3StudioShell:
         meta = self._cluster_meta(summary.work_set)
         color = self._cluster_color(summary.work_set, active.color)
         draft = {
+            "name": summary.work_set.name,
             "color": str(meta.get("color") or ""),
             "favorite": bool(meta.get("favorite")),
             "description": str(meta.get("description") or ""),
@@ -3699,6 +4796,7 @@ class AO3StudioShell:
         def save(close: bool = True, notify: bool = True) -> None:
             result = self.container.queue_service.update_cluster_metadata(
                 summary.work_set.id,
+                name=str(draft.get("name") or ""),
                 color=str(draft.get("color") or ""),
                 favorite=bool(draft.get("favorite")),
                 description=str(draft.get("description") or ""),
@@ -3727,6 +4825,7 @@ class AO3StudioShell:
                 ui.label(summary.work_set.name).classes("text-sm font-bold flex-grow").style(glow_text(color, 3))
                 close = ui.button(icon="close", on_click=dialog.close).props("flat round dense size=sm")
                 close.style("color: #94a3b8 !important;")
+            ui.input("Queue name", value=draft["name"]).bind_value(draft, "name").props("dense dark outlined").classes("w-full")
             ui.color_input("Color", value=draft["color"] or color).bind_value(draft, "color").props("dense dark outlined").classes("w-full")
             ui.switch("Favorite", value=draft["favorite"]).bind_value(draft, "favorite").props("dense color=primary")
             ui.textarea("Description", value=draft["description"]).bind_value(draft, "description").props(
@@ -3891,7 +4990,11 @@ class AO3StudioShell:
 
     def _browse_filter_state(self) -> dict[str, Any]:
         active = self.container.fandom_service.ensure_default()
-        stored = self.container.preferences_service.get("browse_filter_state", {})
+        stored = self.container.preferences_service.get(self._browse_filter_state_key(active.fandom_key), None)
+        if not isinstance(stored, dict):
+            legacy = self.container.preferences_service.get("browse_filter_state", {})
+            legacy_fandom = self.container.browse_service.resolve_fandom(str(legacy.get("fandom") or "")) if isinstance(legacy, dict) else ""
+            stored = legacy if legacy_fandom == active.tag else {}
         state: dict[str, Any] = default_fandom_filter(active.tag)
         state.update(active.default_filter or {})
         if isinstance(stored, dict):
@@ -3913,6 +5016,11 @@ class AO3StudioShell:
 
     def _active_fandom(self) -> FandomProfile:
         return self.container.fandom_service.ensure_default()
+
+    def _browse_filter_state_key(self, fandom_key_value: str | None = None) -> str:
+        active = self.container.fandom_service.active_profile()
+        key = fandom_key_value or (active.fandom_key if active else self.container.fandom_service.ensure_default().fandom_key)
+        return f"browse_filter_state:{key}"
 
     def _persist_browse_state(self, state: dict[str, Any]) -> None:
         state["fandom"] = self.container.browse_service.resolve_fandom(str(state.get("fandom") or "")) or DEFAULT_FANDOM
@@ -3941,6 +5049,9 @@ class AO3StudioShell:
                 )
                 self.container.fandom_service.save_profile(profile)
                 self.container.fandom_service.select(profile.fandom_key)
+        active = self.container.fandom_service.active_profile()
+        if active:
+            self.container.preferences_service.set(self._browse_filter_state_key(active.fandom_key), dict(state))
         self.container.preferences_service.set("browse_filter_state", state)
         self.container.preferences_service.set("last_context_type", "fandom")
         self.container.preferences_service.set("last_context_key", state["fandom"])
@@ -4768,10 +5879,40 @@ class AO3StudioShell:
         self.refresh()
 
     @staticmethod
-    def _event_bool(event: Any) -> bool:
-        value = getattr(event, "value", None)
-        if value is None:
-            value = getattr(event, "args", None)
+    def _event_value(event: Any, fallback: Any = None) -> Any:
+        def unwrap(raw: Any) -> Any:
+            if isinstance(raw, dict):
+                for key in ("value", "modelValue", "model-value", "checked", "selected", "args"):
+                    if key in raw:
+                        return unwrap(raw[key])
+                detail = raw.get("detail")
+                if isinstance(detail, dict):
+                    return unwrap(detail)
+                return fallback
+            if isinstance(raw, (list, tuple)) and len(raw) == 1:
+                return unwrap(raw[0])
+            return raw
+
+        missing = object()
+        value = getattr(event, "value", missing)
+        if value is not missing and value is not None:
+            return unwrap(value)
+        args = getattr(event, "args", missing)
+        if args is not missing and args is not None:
+            return unwrap(args)
+        if value is not missing:
+            return unwrap(value)
+        return fallback
+
+    @staticmethod
+    def _event_bool(event: Any, fallback: bool = False) -> bool:
+        value = AO3StudioShell._event_value(event, fallback)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off", ""}:
+                return False
         return bool(value)
 
     def _filter_expanded(self, key: str, default: bool) -> bool:
@@ -5417,15 +6558,99 @@ class AO3StudioShell:
         self.refresh()
 
     def _queue_work(self, work_id: str, button: Any | None = None) -> None:
-        if self.container.queue_service.is_active_for_work(work_id):
-            self._notify("Already queued for evaluation.", "info")
-            self._style_work_action(button, normalized_label_color(self._active_fandom().color))
-            return
+        self._show_queue_work_dialog(work_id, button)
+
+    def _show_queue_work_dialog(self, work_id: str, button: Any | None = None) -> None:
         active = self._active_fandom()
-        self.container.queue_service.enqueue(work_id, reason="Manual queue", fandom_key_value=active.fandom_key)
-        self._invalidate_browse_page_model()
-        self._notify("Queued for evaluation.", "positive")
-        self._style_work_action(button, normalized_label_color(active.color))
+        schema = self.container.schema_service.active_schema()
+        work = self.container.work_library_service.get(work_id)
+        if not work:
+            self._notify("Work was not found.", "negative")
+            return
+        targets = self.container.queue_service.cluster_targets(active.fandom_key)
+        draft = {"name": ""}
+        dialog = ui.dialog()
+        dialog.on("hide", dialog.delete)
+        suggestions_ref: dict[str, Any] = {}
+
+        def set_name(name: str) -> None:
+            draft["name"] = name
+            name_input = suggestions_ref.get("input")
+            if name_input is not None:
+                name_input.set_value(name)
+            render_suggestions()
+
+        def render_suggestions() -> None:
+            container = suggestions_ref.get("container")
+            if container is None:
+                return
+            query = str(draft.get("name") or "").casefold().strip()
+            matches = [
+                target
+                for target in targets
+                if not query or query in target.name.casefold()
+            ][:8]
+            container.clear()
+            with container:
+                if matches:
+                    with ui.row().classes("w-full gap-1 flex-wrap"):
+                        for target in matches:
+                            pill = ui.button(target.name).props("dense rounded no-caps").classes("filter-favorite-pill")
+                            pill.style(self._filter_pill_style(active.color, target.name == draft.get("name")))
+                            pill.on(
+                                "click.stop",
+                                lambda _=None, name=target.name: set_name(name),
+                            )
+                            with pill:
+                                rich_tooltip(
+                                    f"{target.active_count} pending | {target.completed_count} evaluated",
+                                    active.color,
+                                )
+                elif query:
+                    ui.label("Press Save to create this queue.").classes("text-xs text-gray-500")
+                else:
+                    ui.label("Type a queue name or choose an existing queue.").classes("text-xs text-gray-500")
+
+        def update_name(event: Any) -> None:
+            draft["name"] = str(getattr(event, "value", None) or getattr(event, "args", "") or "")
+            render_suggestions()
+
+        def save() -> None:
+            result = self.container.queue_service.queue_work_to_named_cluster(
+                fandom_key=active.fandom_key,
+                cluster_name=str(draft.get("name") or ""),
+                work_id=work_id,
+                schema_key=schema.schema_key,
+            )
+            if result.ok and isinstance(result.payload, dict) and result.payload.get("batch"):
+                self._set_batch_selection("queue", result.payload["batch"].id)
+                self._invalidate_browse_page_model()
+                self._style_work_action(button, normalized_label_color(active.color))
+            self._notify(result.message, "positive" if result.ok else "negative")
+            if result.ok:
+                dialog.close()
+                self.refresh()
+
+        with dialog, ui.card().classes("w-[420px] max-w-[94vw] p-0 gap-0 overflow-hidden").style(wash_background(active.color, 0.16)):
+            with ui.row().classes("w-full items-center justify-between p-3 border-b border-gray-700"):
+                ui.label("Queue Work").classes("text-base font-bold").style(glow_text(active.color, 4))
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense color=white")
+            with ui.column().classes("w-full gap-2 p-3"):
+                ui.label(work.title or f"Work {work.work_id}").classes("text-sm font-bold text-gray-200")
+                ui.label(f"{schema.name} | {short_fandom_name(active.tag)}").classes("text-xs text-gray-500")
+                suggestions_ref["input"] = ui.input(
+                    "Queue name",
+                    value=draft["name"],
+                    autocomplete=[target.name for target in targets],
+                    on_change=update_name,
+                ).bind_value(draft, "name").props("outlined dense dark").classes("w-full")
+                suggestions_ref["container"] = ui.column().classes("w-full gap-1")
+                render_suggestions()
+            with ui.row().classes("w-full justify-end gap-2 p-3 border-t border-gray-700"):
+                ui.button("Save", icon="playlist_add", on_click=lambda: save()).style(
+                    f"background-color: {dark_button_color(active.color)} !important; color: white;"
+                )
+        dialog.open()
 
     def _evaluation_panel(self, work: Work) -> None:
         schema = self.container.schema_service.active_schema()
@@ -5508,7 +6733,12 @@ class AO3StudioShell:
                     reader_classes = f"reader-border-container flex-grow w-full rounded-lg overflow-hidden flex flex-col {border_classes}".strip()
                     with ui.element("div").classes(reader_classes).style(border_style):
                         self._attach_rarity_context_menu(work.work_id, active.color)
-                        with ui.scroll_area().classes("reader-panel-scroll w-full h-full flex-grow"):
+                        reader_scroll = ui.scroll_area(
+                            on_scroll=lambda event, w=work.work_id, c=chapter_index: self._save_reader_scroll_position(w, c, event)
+                        ).classes("reader-panel-scroll w-full h-full flex-grow")
+                        if chapter and result.scroll_percent:
+                            reader_scroll.classes(add="reader-scroll-restoring")
+                        with reader_scroll:
                             if chapter:
                                 characters = self.container.fandom_service.list_characters(active.fandom_key)
                                 selected_character = self._reader_selected_character(
@@ -5522,7 +6752,7 @@ class AO3StudioShell:
                                     rendered,
                                     selected_character.color if selected_character else None,
                                 )
-                                prose_style = html.escape(self._reader_font_style(style_settings), quote=True)
+                                prose_style = html.escape(self._reader_font_style_for_character(style_settings, selected_character), quote=True)
                                 ui.html(
                                     f'<div class="reader-html-root"><div class="reader-prose" style="{prose_style}">{rendered}</div></div>',
                                     sanitize=False,
@@ -5531,11 +6761,24 @@ class AO3StudioShell:
                                 self._empty("hourglass_empty", "Downloading AO3 reader HTML")
                             else:
                                 self._empty("menu_book", result.message or "No reader content downloaded yet")
+                        if chapter and result.scroll_percent:
+                            ui.timer(0.01, lambda s=reader_scroll, p=float(result.scroll_percent): self._restore_reader_scroll(s, p), once=True)
 
     def _set_reader_chapter(self, work_id: str, chapter_index: int) -> None:
         self.container.reader_service.set_position(work_id, max(1, chapter_index), 0.0)
         self.container.preferences_service.set("reader_work_id", work_id)
         self.refresh()
+
+    def _save_reader_scroll_position(self, work_id: str, chapter_index: int, event: Any) -> None:
+        try:
+            percent = float(getattr(event, "vertical_percentage", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return
+        self.container.reader_service.set_position(work_id, max(1, int(chapter_index or 1)), percent)
+
+    def _restore_reader_scroll(self, scroll_area: Any, percent: float) -> None:
+        scroll_area.scroll_to(percent=max(0.0, min(1.0, float(percent or 0.0))), duration=0.0)
+        ui.timer(0.035, lambda s=scroll_area: s.classes(remove="reader-scroll-restoring"), once=True)
 
     def _start_reader_download(self, work_id: str, *, force: bool = False, rerender: bool = True) -> None:
         if self._reader_download_inflight and not force:
@@ -5584,7 +6827,7 @@ class AO3StudioShell:
             self._empty("check_circle", "No pending works match these filters")
             return
         ui.label(model.summary.work_set.name if model.summary else "Queue").classes("text-sm font-bold text-gray-300")
-        self._render_work_list(works, "", render_model=model, lazy_panels=True)
+        self._render_work_list(works, "", render_model=model, lazy_panels=True, show_queue_action=False)
 
     def _page_evaluated(self) -> None:
         if not self.selected_evaluated_cluster_id:
@@ -5610,7 +6853,7 @@ class AO3StudioShell:
             return
         name = model.summary.work_set.name if model.summary else "Evaluated"
         ui.label(f"{name} | {model.schema.name}").classes("text-sm font-bold text-gray-300")
-        self._render_work_list(works, "", render_model=model, lazy_panels=True)
+        self._render_work_list(works, "", render_model=model, lazy_panels=True, show_queue_action=False)
 
     def _queue_run_available(self) -> bool:
         if not self.selected_queue_batch_id:
@@ -5794,6 +7037,7 @@ class AO3StudioShell:
         browse_model: BrowsePageModel | None = None,
         render_model: WorkListRenderModel | None = None,
         lazy_panels: bool = False,
+        show_queue_action: bool = True,
     ) -> None:
         active = self._active_fandom()
         lookup_model = browse_model or render_model
@@ -5864,17 +7108,18 @@ class AO3StudioShell:
                             with kept:
                                 rich_tooltip("Already in Works", active.color)
                         has_left_action = True
-                    if has_left_action:
+                    if has_left_action and show_queue_action:
                         ui.label("|").classes("action-separator")
-                    queue = ui.button(icon="playlist_add").props("round flat dense size=md").classes("work-action-button")
-                    queue.style(f"color: {normalized_label_color(active.color) if is_queued else '#6b7280'} !important;")
-                    queue.on(
-                        "click",
-                        lambda _=None, w=work.work_id, b=queue: self._queue_work(w, b),
-                        js_handler="(event) => { event.stopPropagation(); emit(); }",
-                    )
-                    with queue:
-                        rich_tooltip("Already queued" if is_queued else "Queue for evaluation", active.color)
+                    if show_queue_action:
+                        queue = ui.button(icon="playlist_add").props("round flat dense size=md").classes("work-action-button")
+                        queue.style(f"color: {normalized_label_color(active.color) if is_queued else '#6b7280'} !important;")
+                        queue.on(
+                            "click",
+                            lambda _=None, w=work.work_id, b=queue: self._queue_work(w, b),
+                            js_handler="(event) => { event.stopPropagation(); emit(); }",
+                        )
+                        with queue:
+                            rich_tooltip("Choose evaluation queue", active.color)
                     if browse_actions and not has_assigned_rarity:
                         ui.label("|").classes("action-separator")
                         armed = self.block_armed_work_id == work.work_id
@@ -6724,6 +7969,7 @@ class AO3StudioShell:
             for parameter in stored.get("parameters", []):
                 parameter["polarity"] = str(_score_polarity(parameter.get("polarity")).value)
                 parameter["weight"] = float(parameter.get("weight") or 1.0)
+                parameter["color"] = self._normalize_hex(str(parameter.get("color") or "")) if parameter.get("color") else ""
                 parameter.pop("required", None)
             for schema in stored.get("schemas", []):
                 schema["color"] = self._normalize_hex(str(schema.get("color") or "")) if schema.get("color") else ""
@@ -6733,6 +7979,16 @@ class AO3StudioShell:
         active = self.container.schema_service.active_schema()
         parameters: list[dict[str, Any]] = []
         seen_parameters: set[str] = set()
+        parameter_colors: dict[str, str] = {}
+        for schema in schemas or [active]:
+            ui_rules = schema.aggregation_rules.get("_ui") if isinstance(schema.aggregation_rules, dict) else {}
+            raw_colors = ui_rules.get("parameter_colors") if isinstance(ui_rules, dict) else {}
+            if not isinstance(raw_colors, dict):
+                continue
+            for key, color in raw_colors.items():
+                clean_color = self._normalize_hex(str(color or ""))
+                if clean_color:
+                    parameter_colors[_slug(str(key))] = clean_color
         for schema in schemas or [active]:
             for dimension in schema.dimensions:
                 parameter_id = _slug(dimension.key or dimension.label)
@@ -6746,13 +8002,14 @@ class AO3StudioShell:
                         "description": dimension.description,
                         "weight": dimension.weight,
                         "polarity": str(_score_polarity(getattr(dimension, "polarity", ScorePolarity.POSITIVE)).value),
+                        "color": parameter_colors.get(parameter_id, ""),
                     }
                 )
         if not parameters:
             parameters = [
-                {"id": "story_fit", "name": "Story Fit", "description": "How well the work matches your tastes.", "weight": 1.0, "polarity": "positive"},
-                {"id": "craft", "name": "Craft", "description": "Prose, pacing, structure, and clarity.", "weight": 1.0, "polarity": "positive"},
-                {"id": "emotional_pull", "name": "Emotional Pull", "description": "How strongly it makes you want to continue.", "weight": 1.0, "polarity": "positive"},
+                {"id": "story_fit", "name": "Story Fit", "description": "How well the work matches your tastes.", "weight": 1.0, "polarity": "positive", "color": ""},
+                {"id": "craft", "name": "Craft", "description": "Prose, pacing, structure, and clarity.", "weight": 1.0, "polarity": "positive", "color": ""},
+                {"id": "emotional_pull", "name": "Emotional Pull", "description": "How strongly it makes you want to continue.", "weight": 1.0, "polarity": "positive", "color": ""},
             ]
 
         groups: list[dict[str, Any]] = []
@@ -6842,6 +8099,12 @@ class AO3StudioShell:
                         parameter_ids.append(parameter_id)
             if not parameter_ids:
                 parameter_ids = list(parameters)
+            for parameter in parameters.values():
+                raw_parameter_color = str(parameter.get("color") or "").strip()
+                clean_parameter_color = self._normalize_hex(raw_parameter_color)
+                if raw_parameter_color and not clean_parameter_color:
+                    return ServiceResult(False, f"{parameter.get('name') or 'Parameter'} color must be a hex color.")
+                parameter["color"] = clean_parameter_color
             dimensions = [
                 ScoreDimension(
                     key=_slug(str(parameter.get("id") or parameter.get("name"))),
@@ -6872,9 +8135,19 @@ class AO3StudioShell:
                     for group in selected_groups
                 ],
             }
+            parameter_colors = {
+                _slug(str(parameter.get("id") or parameter.get("name"))): str(parameter.get("color") or "")
+                for parameter in parameters.values()
+                if str(parameter.get("color") or "")
+            }
+            ui_rules = {}
             if clean_color:
-                aggregation_rules["_ui"] = {"color": clean_color}
+                ui_rules["color"] = clean_color
                 schema_row["color"] = clean_color
+            if parameter_colors:
+                ui_rules["parameter_colors"] = parameter_colors
+            if ui_rules:
+                aggregation_rules["_ui"] = ui_rules
             schema = EvaluationSchema(
                 schema_key=_slug(str(schema_row.get("id") or schema_row.get("name") or "local_schema")),
                 name=str(schema_row.get("name") or "Untitled Schema").strip(),
@@ -6978,7 +8251,9 @@ class AO3StudioShell:
             return {str(item.get("id")): item for item in state.get("groups", [])}
 
         def parameter_display_color(parameter: dict[str, Any]) -> str:
-            return "#fca5a5" if _score_polarity(parameter.get("polarity")) is ScorePolarity.NEGATIVE else amber
+            return self._normalize_hex(str(parameter.get("color") or "")) or (
+                "#fca5a5" if _score_polarity(parameter.get("polarity")) is ScorePolarity.NEGATIVE else amber
+            )
 
         def set_parameter_polarity(parameter: dict[str, Any], value: str) -> None:
             parameter["polarity"] = str(_score_polarity(value).value)
@@ -7238,7 +8513,7 @@ class AO3StudioShell:
             def add_parameter() -> None:
                 item_id = make_id("param")
                 state.setdefault("parameters", []).append(
-                    {"id": item_id, "name": f"Parameter {len(state.get('parameters', [])) + 1}", "description": "", "weight": 1.0, "polarity": "positive"}
+                    {"id": item_id, "name": f"Parameter {len(state.get('parameters', [])) + 1}", "description": "", "weight": 1.0, "polarity": "positive", "color": ""}
                 )
                 expanded_parameters.add(item_id)
                 mode["value"] = "parameters"
@@ -7452,6 +8727,9 @@ class AO3StudioShell:
                                         ui.input("Parameter", value=item.get("name", "")).bind_value(item, "name").props(
                                             "dark dense borderless"
                                         ).classes("flex-grow directive-name-input").on("click.stop", lambda _=None: None)
+                                        ui.color_input("Color", value=item.get("color") or color).bind_value(item, "color").props(
+                                            "dark dense outlined"
+                                        ).classes("w-36").on("click.stop", lambda _=None: None)
                                     with ui.row().classes("w-full items-center gap-3 flex-wrap").on("click.stop", lambda _=None: None):
                                         ui.label("Framing").classes("text-xs text-gray-500")
                                         ui.toggle(
@@ -7814,9 +9092,6 @@ class AO3StudioShell:
                                         ui.color_input("Color", value=schema.get("color") or schema_color).bind_value(schema, "color").props(
                                             "dark dense outlined"
                                         ).classes("w-36")
-                                        ui.button("Open editor", icon="open_in_full").props("flat dense").style(
-                                            f"color: {schema_color} !important;"
-                                        ).on("click.stop", lambda _=None, s=schema: show_schema_editor_dialog(s))
                                     ui.label("Parameter groups").classes("text-xs text-gray-500 mt-1")
                                     selected_ids = [str(gid) for gid in schema.get("group_ids", []) if str(gid) in groups]
                                     if selected_ids:

@@ -7,7 +7,10 @@ from app.infrastructure.ao3.models import ChapterReference
 from app.infrastructure.ao3.parser import (
     parse_browse_page,
     parse_fandom_tag_catalog,
+    parse_fandom_suggestions,
     parse_html_download_url,
+    parse_media_categories,
+    parse_media_fandoms,
     parse_reader_html,
     parse_work_page,
 )
@@ -118,3 +121,62 @@ def test_parse_fandom_tag_catalog() -> None:
     assert by_text['Maxine "Max" Caulfield/Chloe Price'].category == "relationship"
     assert by_text['Maxine "Max" Caulfield & Victoria Chase'].category == "platonic"
     assert by_text["Chloe Price (Life is Strange)"].category == "character"
+
+
+def test_parse_fandom_suggestions_from_tag_search_results() -> None:
+    html = """
+    <html><body>
+      <ol class="tag index group">
+        <li>
+          <a class="tag" href="/tags/Life%20is%20Strange%20(Video%20Games%202015%202017%202024%202026)">Life is Strange (Video Games 2015 2017 2024 2026)</a>
+          <span>Fandom</span><span>canonical</span>
+        </li>
+        <li>
+          <a class="tag" href="/tags/Maxine%20%22Max%22%20Caulfield/works">Maxine "Max" Caulfield</a>
+          <span>Character</span>
+        </li>
+      </ol>
+    </body></html>
+    """
+
+    [suggestion] = parse_fandom_suggestions(
+        html,
+        "https://archiveofourown.org/tags/search?tag_search%5Btype%5D=Fandom",
+    )
+
+    assert suggestion.tag == "Life is Strange (Video Games 2015 2017 2024 2026)"
+    assert suggestion.label == "Life is Strange (Video Games 2015 2017 2024 2026)"
+    assert suggestion.url.endswith("/tags/Life%20is%20Strange%20%28Video%20Games%202015%202017%202024%202026%29/works")
+
+
+def test_parse_media_categories_and_fandom_directory_tags() -> None:
+    media_html = """
+    <html><body>
+      <a href="/media/Movies/fandoms">Movies</a>
+      <a href="/media/TV%20Shows/fandoms">TV Shows</a>
+      <a href="/media/Video%20Games/fandoms">Video Games</a>
+    </body></html>
+    """
+    sources = parse_media_categories(media_html, "https://archiveofourown.org/media")
+
+    by_key = {source.media_key: source for source in sources}
+    assert by_key["Movies"].url == "https://archiveofourown.org/media/Movies/fandoms"
+    assert by_key["TV Shows"].label == "TV Shows"
+    assert by_key["Video Games"].color == "#58a6ff"
+
+    fandom_html = """
+    <html><body>
+      <a href="/tags/search">Tags</a>
+      <ol class="index group">
+        <li><a href="/tags/Life%20is%20Strange%20(Video%20Games%202015%202017%202024%202026)/works">Life is Strange (Video Games 2015 2017 2024 2026)</a></li>
+        <li><a href="/tags/Portal/works">Portal</a></li>
+      </ol>
+    </body></html>
+    """
+    suggestions = parse_media_fandoms(fandom_html, "https://archiveofourown.org/media/Video%20Games/fandoms", "Video Games", "Video Games", "#7ee787")
+
+    assert [suggestion.label for suggestion in suggestions] == ["Life is Strange (Video Games 2015 2017 2024 2026)", "Portal"]
+    assert "search" not in {suggestion.tag for suggestion in suggestions}
+    assert suggestions[0].media_key == "Video Games"
+    assert suggestions[0].media_label == "Video Games"
+    assert suggestions[0].color == "#7ee787"

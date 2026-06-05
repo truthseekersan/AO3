@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-06-05
+
+### Added
+- Added compact fandom creation through cached AO3 media-directory suggestions, including category cache controls.
+- Added portable fandom backup/import plumbing and cleanup-gated fandom deletion flow.
+- Added character reader font overrides, per-work POV timeline persistence, and restored Read scroll position memory.
+
+### Changed
+- Refined left-panel fandom search, fandom rows, local stats, and immediate fandom theme refresh behavior.
+- Tightened Edit Fandom character-pill editing, canonical character tag search, cleanup controls, and live color refresh.
+- Preserved Browse/filter/tab state per fandom and reduced visible Read-tab scroll jump during restore.
+
+### Fixed
+- Fixed Queue cleanup consistency, manual queue targeting, and cluster rename flow.
+- Fixed stuck fandom style override toggles and character color picker reversion.
+- Fixed AO3 fandom directory cache selection/search issues and added Cartoons & Comics & Graphic Novels as a cache category.
+
 ## 2026-06-04
 
 ### Changed
