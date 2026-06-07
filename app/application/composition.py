@@ -7,6 +7,7 @@ from app.application.services import (
     AdminRemoteService,
     AO3BrowseService,
     AO3WorkFetchService,
+    DamService,
     EvaluationQueueService,
     QueueEvaluationRunnerService,
     EvaluationService,
@@ -34,6 +35,7 @@ from app.infrastructure.sqlite.repositories import (
     SQLiteBlockedWorkRepository,
     SQLiteBrowseSnapshotRepository,
     SQLiteCharacterProfileRepository,
+    SQLiteDamRepository,
     SQLiteEvaluationBatchRepository,
     SQLiteEvaluationQueueRepository,
     SQLiteEvaluationRepository,
@@ -85,6 +87,7 @@ class ApplicationContainer:
     favorite_tag_repo: SQLiteFavoriteTagRepository
     tag_color_repo: SQLiteTagColorRepository
     rarity_repo: SQLiteRarityRepository
+    dam_repo: SQLiteDamRepository
     identity_service: IdentityService
     mode_service: ModeService
     preferences_service: PreferencesService
@@ -105,6 +108,7 @@ class ApplicationContainer:
     admin_service: AdminRemoteService
     lmstudio_provider: LMStudioEvaluationProvider
     local_model_service: LocalModelService
+    dam_service: DamService
 
 
 def build_container(database_path: Path | None = None) -> ApplicationContainer:
@@ -137,6 +141,7 @@ def build_container(database_path: Path | None = None) -> ApplicationContainer:
     ao3_client = AO3Client()
     remote_client = RemoteStubClient()
     lmstudio_provider = LMStudioEvaluationProvider(settings_repo)
+    dam_repo = SQLiteDamRepository(db)
 
     identity_service = IdentityService(identity_repo)
     mode_service = ModeService(settings_repo, identity_repo)
@@ -203,6 +208,7 @@ def build_container(database_path: Path | None = None) -> ApplicationContainer:
         evaluations=evaluation_repo,
         identities=identity_repo,
     )
+    dam_service = DamService(dam_repo, lmstudio_provider, character_repo, reader_asset_repo, settings_repo)
 
     identity_service.bootstrap()
     fandom_service.ensure_default()
@@ -235,6 +241,7 @@ def build_container(database_path: Path | None = None) -> ApplicationContainer:
         favorite_tag_repo=favorite_tag_repo,
         tag_color_repo=tag_color_repo,
         rarity_repo=rarity_repo,
+        dam_repo=dam_repo,
         identity_service=identity_service,
         mode_service=mode_service,
         preferences_service=preferences_service,
@@ -255,4 +262,5 @@ def build_container(database_path: Path | None = None) -> ApplicationContainer:
         admin_service=admin_service,
         lmstudio_provider=lmstudio_provider,
         local_model_service=local_model_service,
+        dam_service=dam_service,
     )

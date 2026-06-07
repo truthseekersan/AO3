@@ -1128,8 +1128,8 @@ class SQLiteCharacterProfileRepository:
                 conn.execute(
                     """
                     INSERT INTO character_profiles(
-                        id, fandom_key, name, full_name, color, avatar_url, tag_urls_json, notes, reader_style_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        id, fandom_key, name, full_name, color, avatar_url, tag_urls_json, notes, pronoun_type, reader_style_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         character.id,
@@ -1140,6 +1140,7 @@ class SQLiteCharacterProfileRepository:
                         character.avatar_url,
                         _json_dumps(character.tag_urls),
                         character.notes,
+                        character.pronoun_type,
                         _json_dumps(character.reader_style),
                         created_at,
                         now,
@@ -1156,6 +1157,7 @@ class SQLiteCharacterProfileRepository:
                     avatar_url = ?,
                     tag_urls_json = ?,
                     notes = ?,
+                    pronoun_type = ?,
                     reader_style_json = ?,
                     updated_at = ?
                 WHERE id = ?
@@ -1168,6 +1170,7 @@ class SQLiteCharacterProfileRepository:
                     character.avatar_url,
                     _json_dumps(character.tag_urls),
                     character.notes,
+                    character.pronoun_type,
                     _json_dumps(character.reader_style),
                     now,
                     target_id,
@@ -1198,6 +1201,7 @@ class SQLiteCharacterProfileRepository:
             avatar_url=row["avatar_url"],
             tag_urls=list(_json_loads(row["tag_urls_json"], [])),
             notes=row["notes"] if "notes" in row.keys() else None,
+            pronoun_type=row["pronoun_type"] if "pronoun_type" in row.keys() else "F",
             reader_style=dict(reader_style) if isinstance(reader_style, dict) else {},
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -2583,12 +2587,18 @@ class SQLiteReaderAssetRepository:
                     asset.last_checked_at,
                 ),
             )
+            rows = conn.execute(
+                "SELECT chapter_index, dam_status, dam_audio_status FROM reader_chapters WHERE work_id = ?",
+                (asset.work_id,),
+            ).fetchall()
+            status_map = {row["chapter_index"]: (row["dam_status"] or "none", row["dam_audio_status"] or "none") for row in rows}
+
             conn.execute("DELETE FROM reader_chapters WHERE work_id = ?", (asset.work_id,))
             conn.executemany(
                 """
                 INSERT INTO reader_chapters(
-                    work_id, chapter_index, title, ao3_url, anchor, html, text_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    work_id, chapter_index, title, ao3_url, anchor, html, text_hash, dam_status, dam_audio_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -2599,6 +2609,8 @@ class SQLiteReaderAssetRepository:
                         chapter.anchor,
                         chapter.html,
                         chapter.text_hash,
+                        status_map.get(chapter.chapter_index, ("none", "none"))[0],
+                        status_map.get(chapter.chapter_index, ("none", "none"))[1],
                     )
                     for chapter in chapters
                 ],
@@ -2829,3 +2841,152 @@ class SQLiteSharedOverlayRepository:
             last_fetched_at=row["last_fetched_at"],
             source_etag=row["source_etag"],
         )
+
+
+class SQLiteDamRepository:
+    """CRUD for dam_attributions and dam_status/dam_audio_status on reader_chapters."""
+
+    def __init__(self, db: SQLiteDatabase) -> None:
+        self.db = db
+
+    def upsert_attributions(
+        self,
+        work_id: str,
+        chapter_idx: int,
+        attributions: list[dict],
+        model_id: str,
+    ) -> None:
+        now = utc_now_iso()
+        conn = self.db.connect()
+        try:
+            conn.execute(
+                "DELETE FROM dam_attributions WHERE work_id = ? AND chapter_idx = ?",
+                (work_id, chapter_idx),
+            )
+            for row in attributions:
+                conn.execute(
+                    """
+                    INSERT INTO dam_attributions(
+                        work_id, chapter_idx, pid, dam_seq,
+                        quote_text, speaker_id, confidence, model_id, generated_at, is_italics
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        work_id,
+                        chapter_idx,
+                        int(row.get("pid", 0)),
+                        int(row.get("dam_seq", 0)),
+                        str(row.get("quote_text", "")),
+                        row.get("speaker_id"),
+                        row.get("confidence"),
+                        model_id,
+                        now,
+                        int(row.get("is_italics", 0)),
+                    ),
+                )
+            conn.execute(
+                "UPDATE reader_chapters SET dam_status = 'complete' WHERE work_id = ? AND chapter_index = ?",
+                (work_id, chapter_idx),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_attributions(self, work_id: str, chapter_idx: int) -> list[dict]:
+        conn = self.db.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT pid, dam_seq, quote_text, speaker_id, confidence, model_id, generated_at, is_italics
+                FROM dam_attributions
+                WHERE work_id = ? AND chapter_idx = ?
+                ORDER BY pid, dam_seq
+                """,
+                (work_id, chapter_idx),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [
+            {
+                "pid": row["pid"],
+                "dam_seq": row["dam_seq"],
+                "quote_text": row["quote_text"],
+                "speaker_id": row["speaker_id"],
+                "confidence": row["confidence"],
+                "model_id": row["model_id"],
+                "generated_at": row["generated_at"],
+                "is_italics": bool(row["is_italics"]),
+            }
+            for row in rows
+        ]
+
+    def clear_attributions(self, work_id: str, chapter_idx: int) -> None:
+        conn = self.db.connect()
+        try:
+            conn.execute(
+                "DELETE FROM dam_attributions WHERE work_id = ? AND chapter_idx = ?",
+                (work_id, chapter_idx),
+            )
+            conn.execute(
+                "UPDATE reader_chapters SET dam_status = 'none', dam_audio_status = 'none' WHERE work_id = ? AND chapter_index = ?",
+                (work_id, chapter_idx),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_dam_status(self, work_id: str, chapter_idx: int) -> str:
+        conn = self.db.connect()
+        try:
+            row = conn.execute(
+                "SELECT dam_status FROM reader_chapters WHERE work_id = ? AND chapter_index = ?",
+                (work_id, chapter_idx),
+            ).fetchone()
+        finally:
+            conn.close()
+        return str(row["dam_status"] or "none") if row else "none"
+
+    def set_dam_status(self, work_id: str, chapter_idx: int, status: str) -> None:
+        conn = self.db.connect()
+        try:
+            conn.execute(
+                "UPDATE reader_chapters SET dam_status = ? WHERE work_id = ? AND chapter_index = ?",
+                (status, work_id, chapter_idx),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def set_dam_audio_status(self, work_id: str, chapter_idx: int, status: str) -> None:
+        conn = self.db.connect()
+        try:
+            conn.execute(
+                "UPDATE reader_chapters SET dam_audio_status = ? WHERE work_id = ? AND chapter_index = ?",
+                (status, work_id, chapter_idx),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def mark_stale_for_work(self, work_id: str) -> None:
+        conn = self.db.connect()
+        try:
+            conn.execute(
+                "UPDATE reader_chapters SET dam_status = 'stale' WHERE work_id = ? AND dam_status = 'complete'",
+                (work_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def mark_audio_stale_for_work(self, work_id: str) -> None:
+        conn = self.db.connect()
+        try:
+            conn.execute(
+                "UPDATE reader_chapters SET dam_audio_status = 'stale' WHERE work_id = ? AND dam_audio_status = 'complete'",
+                (work_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+

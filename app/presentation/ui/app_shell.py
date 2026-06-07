@@ -291,6 +291,9 @@ class AO3StudioShell:
         self.center_container = None
         self.right_header_container = None
         self.right_container = None
+        self.right_footer_container = None
+        self.dam_trash_armed_chapter = None
+        self._running_work_analyses: set[str] = set()
         self.filter_metadata: Any | None = container.preferences_service.get("last_filter_metadata", None)
         raw_left_summary_split = int(container.preferences_service.get("left_summary_split", 0) or 0)
         self.left_summary_split = 0 if raw_left_summary_split <= 4 else raw_left_summary_split
@@ -317,6 +320,8 @@ class AO3StudioShell:
         self._browse_fetch_inflight_url = ""
         self._browse_fetch_serial = 0
         self._reader_download_inflight = ""
+        self._reader_scroll_timers: list[Any] = []
+        self.reader_expanded_characters: set[str] = set()
         self._pubdate_enrichment_ids: set[str] = set()
         self._pubdate_labels: dict[str, Any] = {}
         self._updatedate_labels: dict[str, Any] = {}
@@ -379,11 +384,12 @@ class AO3StudioShell:
                             with ui.column().classes("right-panel-shell w-full h-full min-h-0 panel-bg overflow-hidden gap-0"):
                                 self.right_header_container = ui.row().classes(
                                     "right-panel-header-strip w-full items-center justify-end gap-1 shrink-0 overflow-hidden"
-                                )
-                                with ui.scroll_area().classes("right-panel-scroll w-full flex-grow min-h-0"):
+                                ).on("click", lambda _=None: (self._disarm_dam_trash(), self._collapse_reader_character_expansions()), js_handler=self._reader_panel_click_js())
+                                with ui.scroll_area().classes("right-panel-scroll w-full flex-grow min-h-0").on("click", lambda _=None: (self._disarm_dam_trash(), self._collapse_reader_character_expansions()), js_handler=self._reader_panel_click_js()):
                                     self.right_container = ui.column().classes(
                                         "right-panel-column w-full gap-3 p-3 overflow-x-hidden items-stretch"
                                     ).style("width: 100%; min-width: 100%; max-width: none;")
+                                self.right_footer_container = ui.element("div").classes("w-full shrink-0 px-3 pb-2").on("click", lambda _=None: (self._disarm_dam_trash(), self._collapse_reader_character_expansions()), js_handler=self._reader_panel_click_js())
         self.refresh()
         ui.timer(0.2, self._prewarm_ao3_browser, once=True)
 
@@ -463,6 +469,7 @@ class AO3StudioShell:
         if page == self.page:
             return
         self.page = page
+        self.dam_trash_armed_chapter = None
         self.container.preferences_service.set("active_page", page)
         self._persist_fandom_page(page)
         self._render_center()
@@ -556,6 +563,28 @@ class AO3StudioShell:
                     tab.classes("workspace-tab")
                     if label == self.page:
                         tab.classes("workspace-tab-active")
+                    if label == "Read":
+                        tab.on("contextmenu", lambda _=None: None, js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }")
+                        with tab:
+                            with ui.context_menu().classes("tag-favorite-menu"):
+                                with ui.column().classes("gap-2 p-2 min-w-[180px]"):
+                                    ui.label("Read Settings").classes("text-xs font-bold uppercase text-gray-500")
+                                    show_notes = ui.checkbox(
+                                        "Show Author's Notes",
+                                        value=self._show_author_notes_enabled(),
+                                        on_change=lambda e: self._toggle_author_notes(e.value)
+                                    )
+                    elif label == "Works":
+                        tab.on("contextmenu", lambda _=None: None, js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }")
+                        with tab:
+                            with ui.context_menu().classes("tag-favorite-menu"):
+                                with ui.column().classes("gap-2 p-2 min-w-[180px]"):
+                                    ui.label("Works Settings").classes("text-xs font-bold uppercase text-gray-500")
+                                    show_all_checkbox = ui.checkbox(
+                                        "Show all works",
+                                        value=bool(self.container.preferences_service.get("show_all_works", False)),
+                                        on_change=lambda e: self._toggle_show_all_works(e.value)
+                                    )
             with ui.row().classes("center-toolbar-right items-center justify-end gap-1 shrink-0 px-2"):
                 if self.page == "Read":
                     reader = self._reader_top_context()
@@ -606,6 +635,20 @@ class AO3StudioShell:
         if self.container.mode_service.admin_widgets_visible():
             tabs.append(OPTIONAL_TABS[1])
         return tabs
+
+    def _show_author_notes_enabled(self) -> bool:
+        return bool(self.container.preferences_service.get("show_author_notes", False))
+
+    def _toggle_author_notes(self, value: bool) -> None:
+        self.container.preferences_service.set("show_author_notes", bool(value))
+        self._notify("Author's notes " + ("shown" if value else "hidden") + " in reader.", "info")
+        self.refresh()
+
+    def _toggle_show_all_works(self, value: bool) -> None:
+        self.container.preferences_service.set("show_all_works", bool(value))
+        self._notify("Showing all works." if value else "Showing works for current fandom only.", "info")
+        self._works_page_model = None
+        self.refresh()
 
     def _current_browse_visible_ids(self) -> list[str]:
         if self._browse_page_model:
@@ -833,12 +876,22 @@ class AO3StudioShell:
         active = self._active_fandom()
         search = str(self.container.preferences_service.get("work_search", "") or "")
         works = self.container.work_library_service.list_collected(100, search)
+        show_all = bool(self.container.preferences_service.get("show_all_works", False))
+        if not show_all:
+            with self.container.db.connect() as conn:
+                rows = conn.execute(
+                    "SELECT work_id FROM work_collection WHERE fandom_key = ?",
+                    (active.fandom_key,),
+                ).fetchall()
+            fandom_work_ids = {str(row["work_id"]) for row in rows}
+            works = [w for w in works if w.work_id in fandom_work_ids]
         schema = self.container.schema_service.active_schema()
         cache_key = (
             "works",
             active.fandom_key,
             search,
             schema.schema_key,
+            show_all,
             tuple(work.work_id for work in works),
             tuple(work.last_scraped_at for work in works),
         )
@@ -869,7 +922,7 @@ class AO3StudioShell:
         self.refresh()
 
     def _reader_top_context(self) -> dict[str, str] | None:
-        work_id = str(self.container.preferences_service.get("reader_work_id", "") or self.selected_work_id or "")
+        work_id = self._get_reader_work_id()
         if not work_id:
             return None
         result = self.container.reader_service.open_work(work_id, auto_download=False)
@@ -2084,7 +2137,7 @@ class AO3StudioShell:
         style_override = self.container.style_service.fandom_override(active.fandom_key)
         style_state = dict(style_override.settings)
         style_enabled = self.container.style_service.override_sections(style_override)
-        character_draft = {"name": "", "full_name": "", "color": draft["color"], "avatar_url": "", "tag_urls": "", "notes": ""}
+        character_draft = {"name": "", "full_name": "", "color": draft["color"], "avatar_url": "", "tag_urls": "", "notes": "", "pronoun_type": "f"}
         initial_tab = str(self.container.preferences_service.get("fandom_dialog_tab", "Identity") or "Identity")
         if initial_tab not in {"Identity", "Style", "Config", "Characters"}:
             initial_tab = "Identity"
@@ -2505,10 +2558,16 @@ class AO3StudioShell:
                 avatar_url=str(draft.get("avatar_url") or ""),
                 tag_urls=[canonical_tag_url] if canonical_tag_url else [],
                 notes=str(draft.get("notes") or ""),
+                pronoun_type=str(draft.get("pronoun_type", "f")),
                 reader_style=dict(draft.get("reader_style") or {}),
             )
             if notify:
                 self._notify(result.message, "positive" if result.ok else "warning")
+            if result.ok:
+                # Mark DAM attributions stale when character data changes
+                reader_wid = self._get_reader_work_id()
+                if reader_wid:
+                    self.container.dam_service.mark_stale(reader_wid)
             if result.ok and character_id is None:
                 character_draft.update({"name": "", "full_name": "", "tag_urls": "", "notes": ""})
             if rerender:
@@ -2732,6 +2791,7 @@ class AO3StudioShell:
                             "avatar_url": character.avatar_url or "",
                             "tag_urls": _canonical_ao3_character_tag_url((character.tag_urls or [""])[0] or display_full_name or display_name),
                             "notes": character.notes or "",
+                            "pronoun_type": character.pronoun_type,
                             "reader_style": normalize_character_reader_style(character.reader_style),
                         }
                         with ui.element("div").classes("soft-panel w-full p-2 character-profile-expanded").style(expanded_style).on(
@@ -2756,6 +2816,35 @@ class AO3StudioShell:
                                     "dark outlined dense"
                                 ).classes("flex-grow")
                                 full_name_field.on("blur", lambda _=None, d=draft, cid=character.id: autosave_character_draft(d, cid))
+
+                                def _update_btn_style(btn, t, c):
+                                    btn.set_text(t.upper())
+                                    base_color = normalized_label_color(c)
+                                    if t.isupper():
+                                        btn.style(f"color: {base_color} !important; border-color: {base_color} !important; opacity: 1;")
+                                    else:
+                                        btn.style("color: #64748b !important; border-color: #334155 !important; opacity: 0.6;")
+
+                                def _toggle_g(_=None, d=draft, cid=character.id, btn=None, color=character.color):
+                                    t = d.get("pronoun_type") or "f"
+                                    nxt = {"F": "M", "M": "F", "f": "m", "m": "f"}.get(t, "f")
+                                    d["pronoun_type"] = nxt
+                                    _update_btn_style(btn, nxt, color)
+                                    autosave_character_draft(d, cid)
+
+                                def _toggle_a(_=None, d=draft, cid=character.id, btn=None, color=character.color):
+                                    t = d.get("pronoun_type") or "f"
+                                    nxt = {"F": "f", "M": "m", "f": "F", "m": "M"}.get(t, "f")
+                                    d["pronoun_type"] = nxt
+                                    _update_btn_style(btn, nxt, color)
+                                    autosave_character_draft(d, cid)
+
+                                p_btn = ui.button(draft.get("pronoun_type", "f").upper()).props("outline dense").classes("w-10 px-0")
+                                _update_btn_style(p_btn, draft.get("pronoun_type", "f"), character.color)
+                                p_btn.on("click", lambda _=None, d=draft, cid=character.id, b=p_btn, c=character.color: _toggle_g(_, d, cid, b, c))
+                                p_btn.on("contextmenu.prevent", lambda _=None, d=draft, cid=character.id, b=p_btn, c=character.color: _toggle_a(_, d, cid, b, c))
+                                with p_btn:
+                                    rich_tooltip("Left-click: F/M, Right-click: ON/OFF", character.color)
                                 color_field = ui.color_input(
                                     "Color",
                                     value=draft["color"],
@@ -2822,6 +2911,33 @@ class AO3StudioShell:
                     full_name_input = ui.input("Full Name", value=character_draft["full_name"]).bind_value(character_draft, "full_name").props(
                         "dark outlined dense"
                     ).classes("flex-grow")
+
+                    def _update_new_btn_style(btn, t, c):
+                        btn.set_text(t.upper())
+                        base_color = normalized_label_color(c)
+                        if t.isupper():
+                            btn.style(f"color: {base_color} !important; border-color: {base_color} !important; opacity: 1;")
+                        else:
+                            btn.style("color: #64748b !important; border-color: #334155 !important; opacity: 0.6;")
+
+                    def _toggle_new_g(_=None, d=character_draft, btn=None):
+                        t = d.get("pronoun_type") or "f"
+                        nxt = {"F": "M", "M": "F", "f": "m", "m": "f"}.get(t, "f")
+                        d["pronoun_type"] = nxt
+                        _update_new_btn_style(btn, nxt, d["color"])
+
+                    def _toggle_new_a(_=None, d=character_draft, btn=None):
+                        t = d.get("pronoun_type") or "f"
+                        nxt = {"F": "f", "M": "m", "f": "F", "m": "M"}.get(t, "f")
+                        d["pronoun_type"] = nxt
+                        _update_new_btn_style(btn, nxt, d["color"])
+
+                    p_new_btn = ui.button(character_draft.get("pronoun_type", "f").upper()).props("outline dense").classes("w-10 px-0")
+                    _update_new_btn_style(p_new_btn, character_draft.get("pronoun_type", "f"), character_draft["color"])
+                    p_new_btn.on("click", lambda _=None, d=character_draft, b=p_new_btn: _toggle_new_g(_, d, b))
+                    p_new_btn.on("contextmenu.prevent", lambda _=None, d=character_draft, b=p_new_btn: _toggle_new_a(_, d, b))
+                    with p_new_btn:
+                        rich_tooltip("Left-click: F/M, Right-click: ON/OFF", character_draft["color"])
                 with ui.row().classes("w-full gap-2 items-end"):
                     ui.color_input("Color", value=character_draft["color"]).bind_value(character_draft, "color").props("dark outlined dense").classes("w-32")
                     refresh = ui.button(icon="cloud_sync").props("flat round dense")
@@ -3178,6 +3294,9 @@ class AO3StudioShell:
         self._inline_work_panel_slots.clear()
         self._block_buttons.clear()
         self._work_remove_buttons.clear()
+        for t in self._reader_scroll_timers:
+            t.deactivate()
+        self._reader_scroll_timers.clear()
         self.center_container.clear()
         with self.center_container:
             renderer = {
@@ -4179,7 +4298,7 @@ class AO3StudioShell:
                 with header_hit:
                     self._render_cluster_cleanup_toolbar("evaluated", active.color)
             elif self.page == "Read":
-                work_id = str(self.container.preferences_service.get("reader_work_id", "") or self.selected_work_id or "")
+                work_id = self._get_reader_work_id()
                 result = self.container.reader_service.open_work(work_id, auto_download=False) if work_id else None
                 if result and result.work:
                     work = result.work
@@ -4206,6 +4325,157 @@ class AO3StudioShell:
                         )
                         with sticky:
                             rich_tooltip("POV persists between chapters" if sticky_enabled else "POV does not persist between chapters", sticky_color)
+
+                        # ── Tinted Dialogue Mode controls ──
+                        dam_enabled = self._reader_dam_enabled(work.work_id)
+                        narration_tint = self._reader_dam_narration_tint_enabled(work.work_id)
+
+                        if dam_enabled:
+                            reverse_tint = self._reader_dam_reverse_narration_tint_enabled()
+                            ui.element("span").classes("reader-dam-separator")
+                            if reverse_tint and narration_tint:
+                                nt_icon = "invert_colors"
+                                nt_color = normalized_label_color(active.color)
+                                nt_tooltip = "Reverse tinted narration active (Left-click to disable narration tint, Right-click to switch to regular tinted narration)"
+                            elif narration_tint:
+                                nt_icon = "format_color_text"
+                                nt_color = normalized_label_color(active.color)
+                                nt_tooltip = "Tinted narration active (Left-click to disable narration tint, Right-click for reverse tinted narration)"
+                            else:
+                                nt_icon = "format_color_text"
+                                nt_color = "#64748b"
+                                nt_tooltip = "Neutral narration (Left-click to enable tinted narration, Right-click for reverse tinted narration)"
+
+                            nt_btn = ui.button(icon=nt_icon).props("round flat dense size=sm")
+                            nt_btn.classes("reader-pov-header-icon")
+                            nt_btn.style(f"color: {nt_color} !important;")
+
+                            def on_nt_left_click(w=work.work_id, nt=narration_tint, rt=reverse_tint):
+                                if rt and nt:
+                                    self.container.preferences_service.set(self._reader_dam_narration_tint_key(w), False)
+                                    self._set_reader_dam_reverse_narration_tint(False)
+                                elif nt:
+                                    self.container.preferences_service.set(self._reader_dam_narration_tint_key(w), False)
+                                    self._set_reader_dam_reverse_narration_tint(False)
+                                else:
+                                    self.container.preferences_service.set(self._reader_dam_narration_tint_key(w), True)
+                                    self._set_reader_dam_reverse_narration_tint(False)
+                                self._render_right_header()
+                                self._render_center()
+
+                            def on_nt_right_click(w=work.work_id, nt=narration_tint, rt=reverse_tint):
+                                if rt and nt:
+                                    self.container.preferences_service.set(self._reader_dam_narration_tint_key(w), True)
+                                    self._set_reader_dam_reverse_narration_tint(False)
+                                elif nt:
+                                    self.container.preferences_service.set(self._reader_dam_narration_tint_key(w), True)
+                                    self._set_reader_dam_reverse_narration_tint(True)
+                                else:
+                                    self.container.preferences_service.set(self._reader_dam_narration_tint_key(w), True)
+                                    self._set_reader_dam_reverse_narration_tint(True)
+                                self._render_right_header()
+                                self._render_center()
+
+                            nt_btn.on("click.stop", lambda _=None: on_nt_left_click())
+                            nt_btn.on("contextmenu.prevent", lambda _=None: on_nt_right_click())
+                            with nt_btn:
+                                rich_tooltip(nt_tooltip, active.color)
+
+                            ui.element("span").classes("reader-dam-separator")
+                            italics_enabled = self._reader_dam_italics_enabled(work.work_id)
+                            it_icon_color = normalized_label_color(active.color) if italics_enabled else "#64748b"
+                            it_btn = ui.button(icon="format_italic").props("round flat dense size=sm")
+                            it_btn.classes("reader-pov-header-icon")
+                            it_btn.style(f"color: {it_icon_color} !important;")
+                            it_btn.on(
+                                "click.stop",
+                                lambda _=None, w=work.work_id, it=italics_enabled: (
+                                    self.container.preferences_service.set(self._reader_dam_italics_enabled_key(w), not it),
+                                    self._render_right_header(),
+                                    self._render_center(),
+                                ),
+                            )
+                            with it_btn:
+                                rich_tooltip("Tinted italics" if italics_enabled else "Neutral italics", active.color)
+
+                        ui.element("span").classes("reader-dam-separator")
+                        dam_icon_color = normalized_label_color(active.color) if dam_enabled else "#64748b"
+                        dam_btn = ui.button(icon="format_paint").props("round flat dense size=sm")
+                        dam_btn.classes("reader-pov-header-icon")
+                        dam_btn.style(f"color: {dam_icon_color} !important;")
+                        dam_btn.on(
+                            "click.stop",
+                            lambda _=None, w=work.work_id, de=dam_enabled: (
+                                self.container.preferences_service.set(self._reader_dam_enabled_key(w), not de),
+                                self._render_right_header(),
+                                self._render_right(),
+                                self._render_center(),
+                            ),
+                        )
+                        dam_btn.on(
+                            "contextmenu",
+                            lambda _=None: None,
+                            js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
+                        )
+                        with dam_btn:
+                            rich_tooltip("Tinted Dialogue Mode" if not dam_enabled else "Disable Tinted Dialogue", active.color)
+                            
+                            fandom_key = active.fandom_key
+                            disable_name_color = bool(self.container.preferences_service.get(f"reader_disable_name_color:{fandom_key}", False))
+                            disable_name_glow = bool(self.container.preferences_service.get(f"reader_disable_name_glow:{fandom_key}", False))
+                            dialogue_style = self.container.preferences_service.get(f"reader_dialogue_style:{fandom_key}", "none")
+                            
+                            with ui.context_menu().classes("tag-favorite-menu"):
+                                def set_fandom_pref(key: str, val: Any) -> None:
+                                    self.container.preferences_service.set(key, val)
+                                    self._render_center()
+                                
+                                def set_dialogue_style(style_type: str, checked: bool) -> None:
+                                    target = style_type if checked else "none"
+                                    self.container.preferences_service.set(f"reader_dialogue_style:{fandom_key}", target)
+                                    self._render_center()
+
+                                with ui.column().classes("gap-2 p-2 min-w-[220px]"):
+                                    ui.label("Dialogue Settings").classes("text-xs font-bold uppercase text-gray-500")
+                                    ui.checkbox(
+                                        "Disable Name Color",
+                                        value=disable_name_color,
+                                        on_change=lambda e: set_fandom_pref(f"reader_disable_name_color:{fandom_key}", e.value)
+                                    )
+                                    ui.checkbox(
+                                        "Disable Glow Effect",
+                                        value=disable_name_glow,
+                                        on_change=lambda e: set_fandom_pref(f"reader_disable_name_glow:{fandom_key}", e.value)
+                                    )
+                                    cb_all = ui.checkbox(
+                                        "Dialogue gets name look",
+                                        value=(dialogue_style == "all"),
+                                    )
+                                    cb_pov = ui.checkbox(
+                                        "POV dialogue gets name look",
+                                        value=(dialogue_style == "pov"),
+                                    )
+                                    _dialogue_updating = [False]
+                                    def on_all_change(e, cb=cb_pov) -> None:
+                                        if _dialogue_updating[0]:
+                                            return
+                                        _dialogue_updating[0] = True
+                                        if e.value:
+                                            cb.set_value(False)
+                                        set_dialogue_style("all", e.value)
+                                        _dialogue_updating[0] = False
+                                    def on_pov_change(e, cb=cb_all) -> None:
+                                        if _dialogue_updating[0]:
+                                            return
+                                        _dialogue_updating[0] = True
+                                        if e.value:
+                                            cb.set_value(False)
+                                        set_dialogue_style("pov", e.value)
+                                        _dialogue_updating[0] = False
+                                    cb_all.on_value_change(on_all_change)
+                                    cb_pov.on_value_change(on_pov_change)
+
+                        ui.element("span").classes("reader-dam-separator")
                         reset = ui.button(icon="restart_alt").props("round flat dense size=sm")
                         reset.classes("reader-pov-header-icon")
                         reset.style(f"color: {normalized_label_color(active.color)} !important;")
@@ -4221,6 +4491,7 @@ class AO3StudioShell:
         else:
             self.right_container.classes(add="gap-3 p-3", remove="right-panel-batch-mode h-full min-h-full gap-0 p-0")
         self.right_container.clear()
+        self._render_right_footer()
         with self.right_container:
             if self.page == "Browse":
                 self._render_browse_lookup_panel()
@@ -4270,6 +4541,163 @@ class AO3StudioShell:
                     ui.label("Notes").classes("text-sm font-bold")
                     ui.markdown(view.local_evaluation.notes_markdown).classes("text-sm")
 
+    def _disarm_dam_trash(self) -> None:
+        if self.dam_trash_armed_chapter:
+            self.dam_trash_armed_chapter = None
+            self._render_right_footer()
+
+    def _render_right_footer(self) -> None:
+        if not self.right_footer_container:
+            return
+        self.right_footer_container.clear()
+        if self.page != "Read":
+            self.right_footer_container.set_visibility(False)
+            return
+        active, work, chapter_index, chapter, characters = self._reader_context()
+        if not work or not self._reader_dam_enabled(work.work_id) or not chapter:
+            self.right_footer_container.set_visibility(False)
+            return
+        self.right_footer_container.set_visibility(True)
+        accent = normalized_label_color(active.color)
+        dam_status = self.container.dam_service.get_dam_status(work.work_id, chapter_index)
+        characters_for_dam = self.container.fandom_service.list_characters(active.fandom_key)
+        selected_dam_id = self._reader_selected_character_id(
+            work.work_id, chapter_index, characters_for_dam, chapter.html,
+        )
+        with self.right_footer_container, ui.row().classes("w-full items-center justify-between pt-2 border-t border-gray-700"):
+            with ui.row().classes("items-center gap-1 min-w-0"):
+                # Chapter analysis button / spinner
+                if dam_status == "pending":
+                    ui.spinner(size="sm").style(f"color: {accent};")
+                else:
+                    ch_btn = ui.button(icon="auto_fix_high").props("flat round dense size=sm")
+                    ch_btn.style(f"color: {accent} !important;")
+                    ch_btn.on(
+                        "click.stop",
+                        lambda _=None, w=work.work_id, ci=chapter_index, ch=chapter.html, fk=active.fandom_key, sid=selected_dam_id: self._run_dam_analysis(w, ci, ch, fk, sid),
+                    )
+                    with ch_btn:
+                        rich_tooltip("Re-analyze current chapter" if dam_status in {"complete", "stale"} else "Analyze current chapter", active.color)
+
+                # Separator
+                ui.label("|").classes("text-gray-600 px-1")
+
+                # Work analysis button
+                is_work_running = work.work_id in self._running_work_analyses
+                work_btn = ui.button(icon="auto_awesome").props("flat round dense size=sm")
+                work_btn.style(f"color: {accent} !important;")
+                if is_work_running:
+                    work_btn.props("disable")
+                    with work_btn:
+                        rich_tooltip("Work analysis in progress...", "#94a3b8")
+                else:
+                    work_btn.on(
+                        "click.stop",
+                        lambda _=None, w=work.work_id, fk=active.fandom_key: self._run_dam_work_analysis_ui(w, fk),
+                    )
+                    with work_btn:
+                        rich_tooltip("Analyze all unanalyzed chapters in this work", active.color)
+
+                # Status text
+                if dam_status == "pending":
+                    ui.label("Analyzing…").classes("text-[11px] ml-2").style("color: #94a3b8;")
+                elif dam_status == "complete":
+                    ui.icon("check_circle").style(f"color: {accent}; font-size: 16px; margin-left: 8px;")
+                    attribs = self.container.dam_service.get_attributions(work.work_id, chapter_index)
+                    count = len(attribs)
+                    ui.label(f"{count} dialogue{'s' if count != 1 else ''} attributed").classes("text-[11px] ml-1").style("color: #94a3b8;")
+                elif dam_status == "stale":
+                    ui.icon("update").style(f"color: #f59e0b; font-size: 16px; margin-left: 8px;")
+                    ui.label("Outdated").classes("text-[11px] ml-1").style("color: #f59e0b;")
+
+            # Trashbin
+            if dam_status in {"complete", "stale"}:
+                is_armed = self.dam_trash_armed_chapter == (work.work_id, chapter_index)
+                trash_icon = "delete" if is_armed else "delete_outline"
+                trash_color = "#ef4444" if is_armed else "#64748b"
+                tooltip_text = "Click again to confirm delete" if is_armed else "Clear attributions"
+                clear_btn = ui.button(icon=trash_icon).props("round flat dense size=xs")
+                clear_btn.style(f"color: {trash_color} !important;")
+                def on_trash_click(w=work.work_id, ci=chapter_index):
+                    if self.dam_trash_armed_chapter == (w, ci):
+                        self.container.dam_service.clear_attributions(w, ci)
+                        self.dam_trash_armed_chapter = None
+                        self._render_right()
+                        self._render_center()
+                    else:
+                        self.dam_trash_armed_chapter = (w, ci)
+                        self._render_right_footer()
+                clear_btn.on("click.stop", lambda _=None: on_trash_click())
+                with clear_btn:
+                    rich_tooltip(tooltip_text, trash_color)
+
+    def _run_dam_work_analysis_ui(self, work_id: str, fandom_key: str) -> None:
+        """Entry point for Work-wide analysis from UI."""
+        background_tasks.create(
+            self._run_dam_work_analysis(work_id, fandom_key),
+            name=f"dam-work-analysis-{work_id}"
+        )
+
+    async def _run_dam_work_analysis(self, work_id: str, fandom_key: str) -> None:
+        """Run DAM analysis for all unanalyzed chapters in the background."""
+        import asyncio
+        if work_id in self._running_work_analyses:
+            self._notify("Work analysis is already in progress.", "warning")
+            return
+        self._running_work_analyses.add(work_id)
+        self._render_right()
+        try:
+            result = await run.io_bound(lambda: self.container.reader_service.open_work(work_id, auto_download=False))
+            if not result.work or not result.chapters:
+                self._notify("No chapters found to analyze", "warning")
+                return
+
+            to_analyze = []
+            for chapter in result.chapters:
+                status = await run.io_bound(lambda ch=chapter: self.container.dam_service.get_dam_status(work_id, ch.chapter_index))
+                if status != "complete":
+                    to_analyze.append(chapter)
+
+            if not to_analyze:
+                self._notify("All chapters are already analyzed.", "positive")
+                return
+
+            self._notify(f"Analyzing {len(to_analyze)} chapter(s) of '{result.work.title}' in the background.", "info")
+
+            for i, chapter in enumerate(to_analyze, 1):
+                await run.io_bound(lambda ch=chapter: self.container.dam_service.dam_repo.set_dam_status(work_id, ch.chapter_index, "pending"))
+                self._render_right()
+
+                characters_for_dam = await run.io_bound(lambda: self.container.fandom_service.list_characters(fandom_key))
+                selected_dam_id = self._reader_selected_character_id(
+                    work_id, chapter.chapter_index, characters_for_dam, chapter.html
+                )
+
+                loop = asyncio.get_event_loop()
+                res = await loop.run_in_executor(
+                    None,
+                    lambda ch=chapter, fk=fandom_key, sid=selected_dam_id: self.container.dam_service.run_attribution(
+                        work_id, ch.chapter_index, ch.html, fk, sid, auto_unload=False
+                    )
+                )
+                if not res.ok:
+                    self._notify(f"Chapter {chapter.chapter_index} failed: {res.message}", "warning")
+                else:
+                    self._notify(f"Chapter {chapter.chapter_index} analyzed ({i}/{len(to_analyze)}).", "positive")
+                
+                self._render_right()
+                self._render_center()
+        finally:
+            if self.container.local_model_service.config().get("auto_unload", False):
+                try:
+                    model = self.container.local_model_service.config().get("model")
+                    if model:
+                        await run.io_bound(self.container.local_model_service.unload_selected_model)
+                except Exception:
+                    pass
+            self._running_work_analyses.discard(work_id)
+            self._render_right()
+
     def _render_works_side_panel(self) -> None:
         active = self._active_fandom()
         state = {"search": self.container.preferences_service.get("work_search", "")}
@@ -4304,7 +4732,7 @@ class AO3StudioShell:
 
     def _render_reader_side_panel(self) -> None:
         active = self._active_fandom()
-        work_id = str(self.container.preferences_service.get("reader_work_id", "") or self.selected_work_id or "")
+        work_id = self._get_reader_work_id()
         if not work_id:
             self._empty("menu_book", "Select a work")
             return
@@ -4382,7 +4810,8 @@ class AO3StudioShell:
                 rich_tooltip("No POV tint", active.color)
             for character in visible_characters:
                 display_name, _ = _character_profile_display_names(character)
-                selected = character.id == selected_id
+                expanded = character.id in self.reader_expanded_characters
+                selected = (character.id == selected_id) or expanded
                 pill = ui.element("button").props("type=button").classes(
                     "work-tag-pill browse-tag-pill reader-character-pill text-[11px]"
                 )
@@ -4392,10 +4821,22 @@ class AO3StudioShell:
                     lambda _=None, c=character, w=work.work_id, ch=chapter_index: self._set_reader_character_selection(c.id, w, ch),
                     js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
                 )
+                pill.on(
+                    "contextmenu",
+                    lambda _=None, cid=character.id: self._toggle_reader_character_expansion(cid),
+                    js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }",
+                )
                 with pill:
                     self._avatar_image(character.avatar_url, display_name, character.color, "22px", "200px", expand_side="left")
                     ui.label(display_name).classes("browse-tag-pill-label reader-character-pill-label")
                     rich_tooltip("Selected POV tint" if selected else "Select POV tint", character.color)
+            for character in visible_characters:
+                if character.id in self.reader_expanded_characters:
+                    self._render_character_expanded_panel(
+                        active,
+                        character,
+                        rerender_callback=self._render_right
+                    )
 
     @staticmethod
     def _reader_selected_character_key(work_id: str, chapter_index: int) -> str:
@@ -4424,9 +4865,118 @@ class AO3StudioShell:
     def _reader_pov_sticky_enabled(self, work_id: str) -> bool:
         return bool(self.container.preferences_service.get(self._reader_pov_sticky_key(work_id), False))
 
+    def _reader_work_id_key(self, fandom_key: str | None = None) -> str:
+        active = self.container.fandom_service.active_profile()
+        key = fandom_key or (active.fandom_key if active else self.container.fandom_service.ensure_default().fandom_key)
+        return f"reader_work_id:{key}"
+
+    def _get_reader_work_id(self) -> str:
+        active = self._active_fandom()
+        key = self._reader_work_id_key(active.fandom_key)
+        # 1. Fetch fandom-scoped reader_work_id
+        work_id = str(self.container.preferences_service.get(key, "") or "")
+        if work_id:
+            return work_id
+        # 2. Fall back to selected_work_id if it belongs to this fandom
+        if self.selected_work_id and self._is_work_in_fandom(self.selected_work_id, active.fandom_key, active.tag):
+            return self.selected_work_id
+        return ""
+
+    def _is_work_in_fandom(self, work_id: str, fandom_key: str, fandom_tag: str) -> bool:
+        if not work_id:
+            return False
+        with self.container.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                WHERE EXISTS (
+                    SELECT 1 FROM work_tags
+                    WHERE work_tags.work_id = ?
+                      AND work_tags.tag_type = 'fandom'
+                      AND work_tags.tag_text = ?
+                ) OR EXISTS (
+                    SELECT 1 FROM work_collection
+                    WHERE work_collection.work_id = ?
+                      AND work_collection.fandom_key = ?
+                ) OR EXISTS (
+                    SELECT 1 FROM work_set_items
+                    JOIN work_sets ON work_sets.id = work_set_items.set_id
+                    WHERE work_set_items.work_id = ?
+                      AND work_sets.fandom_key = ?
+                ) OR EXISTS (
+                    SELECT 1 FROM evaluation_queue
+                    JOIN evaluation_batches ON evaluation_batches.id = evaluation_queue.batch_id
+                    WHERE evaluation_queue.work_id = ?
+                      AND evaluation_batches.fandom_key = ?
+                ) OR EXISTS (
+                    SELECT 1 FROM evaluation_batches
+                    JOIN work_sets ON work_sets.id = evaluation_batches.work_set_id
+                    JOIN work_set_items ON work_set_items.set_id = work_sets.id
+                    WHERE work_set_items.work_id = ?
+                      AND evaluation_batches.fandom_key = ?
+                )
+                """,
+                (
+                    work_id, fandom_tag,
+                    work_id, fandom_key,
+                    work_id, fandom_key,
+                    work_id, fandom_key,
+                    work_id, fandom_key,
+                )
+            ).fetchone()
+            return bool(row)
+
+    def _find_fandom_for_work(self, work_id: str) -> str | None:
+        if not work_id:
+            return None
+        with self.container.db.connect() as conn:
+            # 1. Check work_collection
+            row = conn.execute("SELECT fandom_key FROM work_collection WHERE work_id = ?", (work_id,)).fetchone()
+            if row and row["fandom_key"]:
+                return str(row["fandom_key"])
+
+            # 2. Check work sets
+            row = conn.execute(
+                """
+                SELECT fandom_key FROM work_sets
+                JOIN work_set_items ON work_sets.id = work_set_items.set_id
+                WHERE work_set_items.work_id = ?
+                LIMIT 1
+                """,
+                (work_id,),
+            ).fetchone()
+            if row and row["fandom_key"]:
+                return str(row["fandom_key"])
+
+            # 3. Check evaluation batches
+            row = conn.execute(
+                """
+                SELECT fandom_key FROM evaluation_batches
+                JOIN evaluation_queue ON evaluation_batches.id = evaluation_queue.batch_id
+                WHERE evaluation_queue.work_id = ?
+                LIMIT 1
+                """,
+                (work_id,),
+            ).fetchone()
+            if row and row["fandom_key"]:
+                return str(row["fandom_key"])
+
+            # 4. Check tags mapping to existing fandom profile
+            rows = conn.execute(
+                "SELECT tag_text FROM work_tags WHERE work_id = ? AND tag_type = 'fandom'",
+                (work_id,),
+            ).fetchall()
+            tags = {str(row["tag_text"]).strip().casefold() for row in rows if str(row["tag_text"]).strip()}
+            if tags:
+                profiles = self.container.fandom_service.list_profiles()
+                for profile in profiles:
+                    if profile.tag.strip().casefold() in tags:
+                        return profile.fandom_key
+        return None
+
     def _reader_context(self) -> tuple[FandomProfile, Work | None, int, Any | None, list[CharacterProfile]]:
         active = self._active_fandom()
-        work_id = str(self.container.preferences_service.get("reader_work_id", "") or self.selected_work_id or "")
+        work_id = self._get_reader_work_id()
         if not work_id:
             return active, None, 1, None, []
         result = self.container.reader_service.open_work(work_id, auto_download=False)
@@ -4471,11 +5021,492 @@ class AO3StudioShell:
             reader_style=reader_style,
         )
 
+    def _collapse_reader_character_expansions(self) -> None:
+        if self.reader_expanded_characters:
+            self.reader_expanded_characters.clear()
+            self._render_right()
+
+    def _toggle_reader_character_expansion(self, character_id: str) -> None:
+        if character_id in self.reader_expanded_characters:
+            self.reader_expanded_characters.remove(character_id)
+        else:
+            self.reader_expanded_characters.add(character_id)
+        self._render_right()
+
+    def _reader_panel_click_js(self) -> str:
+        return (
+            "(event) => { "
+            "if (event.target.closest('.character-profile-expanded, .character-profile-pill, .reader-character-pill, "
+            ".q-field, .q-btn, button, input, textarea, [role=\"button\"]')) return; "
+            "emit(); "
+            "}"
+        )
+
+    @staticmethod
+    def _input_event_text(event, fallback: Any = "") -> str:
+        if event is not None:
+            if hasattr(event, "args"):
+                args = getattr(event, "args")
+                if args is None:
+                    return ""
+                if isinstance(args, dict):
+                    for key in ("value", "modelValue", "model-value", "text"):
+                        if key in args:
+                            return "" if args[key] is None else str(args[key])
+                    return ""
+                return str(args)
+        return str(fallback)
+
+    def _save_character_from_draft(
+        self,
+        active: FandomProfile,
+        draft: dict[str, Any],
+        character_id: str | None = None,
+        *,
+        notify: bool = True,
+    ) -> ServiceResult:
+        full_name = str(draft.get("full_name") or "").strip()
+        name = str(draft.get("name") or "").strip()
+        canonical_tag_url = _canonical_ao3_character_tag_url(
+            str(draft.get("tag_urls") or "") or full_name or name
+        )
+        if not full_name:
+            _, full_name = _character_names_from_ao3_label(canonical_tag_url or name)
+        if not name:
+            name, _ = _character_names_from_ao3_label(canonical_tag_url or full_name)
+        result = self.container.fandom_service.save_character(
+            fandom_key=active.fandom_key,
+            character_id=character_id,
+            name=name,
+            full_name=full_name,
+            color=str(draft.get("color") or draft["color"]),
+            avatar_url=str(draft.get("avatar_url") or ""),
+            tag_urls=[canonical_tag_url] if canonical_tag_url else [],
+            notes=str(draft.get("notes") or ""),
+            pronoun_type=str(draft.get("pronoun_type", "f")),
+            reader_style=dict(draft.get("reader_style") or {}),
+        )
+        if notify:
+            self._notify(result.message, "positive" if result.ok else "warning")
+        if result.ok:
+            reader_wid = self._get_reader_work_id()
+            if reader_wid:
+                self.container.dam_service.mark_stale(reader_wid)
+        return result
+
+    def _open_character_font_dialog(
+        self,
+        active: FandomProfile,
+        character: CharacterProfile,
+        rerender_callback: Callable[[], None],
+    ) -> None:
+        reader_style = normalize_character_reader_style(character.reader_style)
+        draft = dict(reader_style)
+        accent_color = character.color
+        refs_font: dict[str, Any] = {}
+
+        def set_font(font_value: str) -> None:
+            draft["font_family"] = font_value
+            render_font_pills()
+
+        def render_font_pills() -> None:
+            container = refs_font.get("fonts")
+            if not container:
+                return
+            container.clear()
+            current = str(draft.get("font_family") or DEFAULT_READER_STYLE["preview_font_family"])
+            enabled = bool(draft.get("custom_font_enabled"))
+            with container:
+                for _category, data in FONT_CATEGORIES.items():
+                    for font_value, full_name in data["fonts"].items():
+                        selected = font_value == current
+                        color = self._font_color(font_value)
+                        r, g, b = rgb_from_hex(color)
+                        bg = "0.25" if selected else "0.08"
+                        border = "0.50" if selected else "0.15"
+                        label = self._font_pill_label(full_name)
+                        pill = ui.button(label, on_click=lambda _=None, f=font_value: set_font(f)).props("dense flat rounded no-caps")
+                        pill.classes("px-2 py-1")
+                        pill.style(
+                            f"background: rgba({r},{g},{b},{bg}) !important; border: 1px solid rgba({r},{g},{b},{border}); "
+                            f"color: {color} !important; font-family: {font_value}; {self._font_variation_css(font_value)} "
+                            f"text-shadow: {'0 0 6px ' + color if selected else 'none'}; {'opacity: 0.42;' if not enabled else ''}"
+                        )
+                        with pill:
+                            ui.tooltip(full_name).classes("text-sm").style(
+                                f"font-family: {font_value}; {self._font_variation_css(font_value)} "
+                                f"color: {color}; background: linear-gradient(160deg, rgba({r},{g},{b},0.15), rgba({r},{g},{b},0.08)), #0d1117 !important; "
+                                f"border: 1px solid rgba({r},{g},{b},0.30);"
+                            )
+
+        def save_dialog() -> None:
+            normalized = normalize_character_reader_style(draft)
+            self.container.fandom_service.save_character(
+                fandom_key=character.fandom_key,
+                character_id=character.id,
+                name=character.name,
+                full_name=character.full_name or character.name,
+                color=character.color,
+                avatar_url=character.avatar_url or "",
+                tag_urls=character.tag_urls,
+                notes=character.notes or "",
+                reader_style=normalized,
+            )
+            dialog.close()
+            rerender_callback()
+            self._notify("Character reader font saved.", "positive")
+
+        with self.root or ui.column():
+            dialog = ui.dialog()
+            dialog.on("hide", dialog.delete)
+        cr, cg, cb = rgb_from_hex(accent_color)
+        reader_font_dialog_style = (
+            wash_background(accent_color, 0.14)
+            + f"width: 560px; max-width: 94vw; height: 85vh; max-height: calc(100vh - 24px); border: 1px solid rgba({cr},{cg},{cb},0.26);"
+        )
+        with dialog, ui.card().classes("flex flex-col p-0 gap-0 overflow-hidden").style(reader_font_dialog_style):
+            with ui.row().classes("w-full items-center justify-between p-3 border-b border-gray-700 shrink-0").style(
+                "background: rgba(22, 27, 34, 0.75); backdrop-filter: blur(8px);"
+            ):
+                ui.label(f"{character.name} Reader Font").classes("text-lg font-bold").style(glow_text(accent_color, 4))
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense color=white")
+            with ui.scroll_area().classes("w-full flex-grow min-h-0"):
+                with ui.column().classes("w-full gap-3 p-3"):
+                    with ui.element("div").classes("soft-panel w-full p-3"):
+                        with ui.row().classes("w-full items-center justify-between"):
+                            ui.label("Custom Font").classes("text-sm font-bold").style(glow_text(accent_color, 3))
+                            font_switch = ui.switch(value=draft["custom_font_enabled"]).bind_value(draft, "custom_font_enabled").props("dense color=primary")
+                            font_switch.on("update:model-value", lambda _=None: render_font_pills())
+                        refs_font["fonts"] = ui.row().classes("w-full gap-2 flex-wrap mt-2")
+                        render_font_pills()
+                    with ui.element("div").classes("soft-panel w-full p-3"):
+                        with ui.row().classes("w-full items-center justify-between gap-2"):
+                            ui.label("Starting Font Size").classes("text-sm font-bold").style(glow_text(accent_color, 3))
+                            ui.switch(value=draft["font_size_enabled"]).bind_value(draft, "font_size_enabled").props("dense color=primary")
+                        ui.number("Character Font Size", value=draft.get("font_size", 16.5), min=8, max=48, step=0.5).bind_value(
+                            draft,
+                            "font_size",
+                        ).props("dark outlined dense").classes("w-full mt-2")
+            with ui.row().classes("w-full items-center justify-between p-3 border-t border-gray-700 shrink-0").style(
+                "background: rgba(13, 17, 23, 0.78);"
+            ):
+                ui.label("Disabled toggles keep this as passive character info.").classes("text-xs italic text-gray-500")
+                ui.button("Save", icon="save", on_click=save_dialog).style(
+                    f"background-color: {dark_button_color(accent_color)} !important; color: white;"
+                )
+        dialog.open()
+
+    def _open_character_tint_dialog(
+        self,
+        active: FandomProfile,
+        character: CharacterProfile,
+        rerender_callback: Callable[[], None],
+    ) -> None:
+        enabled_key = f"reader_character_tint_enabled:{active.fandom_key}:{character.id}"
+        color_key = f"reader_character_tint_color:{active.fandom_key}:{character.id}"
+        
+        current_enabled = bool(self.container.preferences_service.get(enabled_key, False))
+        current_color = str(self.container.preferences_service.get(color_key, character.color) or character.color)
+        
+        draft = {
+            "enabled": current_enabled,
+            "color": current_color,
+        }
+        
+        with self.root or ui.column():
+            dialog = ui.dialog()
+            dialog.on("hide", dialog.delete)
+            
+        cr, cg, cb = rgb_from_hex(character.color)
+        dialog_style = (
+            wash_background(character.color, 0.14)
+            + f"width: 400px; max-width: 90vw; border: 1px solid rgba({cr},{cg},{cb},0.26);"
+        )
+        
+        def save_dialog() -> None:
+            self.container.preferences_service.set(enabled_key, draft["enabled"])
+            self.container.preferences_service.set(color_key, draft["color"])
+            dialog.close()
+            rerender_callback()
+            self._render_center()
+            self._notify("Character dialogue tint color saved.", "positive")
+            
+        with dialog, ui.card().classes("flex flex-col p-0 gap-0 overflow-hidden").style(dialog_style):
+            with ui.row().classes("w-full items-center justify-between p-3 border-b border-gray-700 shrink-0").style(
+                "background: rgba(22, 27, 34, 0.75); backdrop-filter: blur(8px);"
+            ):
+                ui.label(f"{character.name} Dialogue Tint").classes("text-lg font-bold").style(glow_text(character.color, 4))
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense color=white")
+            with ui.column().classes("w-full gap-3 p-4"):
+                ui.switch(
+                    "Use custom dialogue tint color",
+                    value=draft["enabled"]
+                ).bind_value(draft, "enabled").props("dense color=primary").classes("text-sm text-gray-300")
+                
+                ui.color_input(
+                    "Tint Color",
+                    value=draft["color"]
+                ).bind_value(draft, "color").props("dark outlined dense").classes("w-full mt-1")
+                
+                with ui.row().classes("w-full justify-end mt-2"):
+                    save_btn = ui.button("Save", icon="save", on_click=save_dialog).props("dense")
+                    save_btn.style(f"background-color: {dark_button_color(character.color)} !important; color: white;")
+        dialog.open()
+
+    def _render_character_expanded_panel(
+        self,
+        active: FandomProfile,
+        character: CharacterProfile,
+        rerender_callback: Callable[[], None],
+    ) -> None:
+        display_name, display_full_name = _character_profile_display_names(character)
+        
+        def character_expanded_style(color: str) -> str:
+            cr, cg, cb = rgb_from_hex(color)
+            return (
+                f"border: 1px solid rgba({cr},{cg},{cb},0.46); "
+                f"background: rgba({cr},{cg},{cb},0.11); "
+                f"box-shadow: 0 0 16px rgba({cr},{cg},{cb},0.12);"
+            )
+
+        def character_font_icon_style(color: str, active: bool) -> str:
+            label_color = normalized_label_color(color)
+            return (
+                f"color: {label_color if active else '#64748b'} !important; "
+                f"--character-font-color: {label_color};"
+            )
+
+        def character_tint_icon_style(color: str, active: bool, custom_color: str) -> str:
+            label_color = normalized_label_color(custom_color if active else color)
+            return (
+                f"color: {label_color if active else '#64748b'} !important; "
+                f"--character-tint-color: {label_color};"
+            )
+
+        def character_tag_suggestion_js() -> str:
+            return (
+                "(event) => { "
+                "const value = String(event?.target?.value ?? event?.detail?.value ?? ''); "
+                "const shell = event?.target?.closest('.character-tag-suggestion-shell'); "
+                "const row = shell?.querySelector('.character-tag-suggestions'); "
+                "if (row && !value.trim()) row.classList.add('hidden'); "
+                "emit(value); "
+                "}"
+            )
+
+        expanded_style = character_expanded_style(character.color)
+        draft = {
+            "name": display_name,
+            "full_name": display_full_name,
+            "color": character.color,
+            "avatar_url": character.avatar_url or "",
+            "tag_urls": _canonical_ao3_character_tag_url((character.tag_urls or [""])[0] or display_full_name or display_name),
+            "notes": character.notes or "",
+            "pronoun_type": character.pronoun_type,
+            "reader_style": normalize_character_reader_style(character.reader_style),
+        }
+        
+        live_refs = {}
+
+        def autosave():
+            self._save_character_from_draft(active, draft, character.id, notify=False)
+
+        def update_color_live(val):
+            color = self._normalize_hex(str(val or ""))
+            if not color:
+                return
+            draft["color"] = color
+            expanded_panel.style(replace=character_expanded_style(color))
+            self._restyle_avatar_refs(live_refs.get("avatar"), color, str(draft.get("name") or ""))
+            
+            font_icon_ref = live_refs.get("font_icon")
+            if font_icon_ref:
+                font_active = bool(draft.get("reader_style", {}).get("custom_font_enabled") or draft.get("reader_style", {}).get("font_size_enabled"))
+                font_icon_ref.style(replace=character_font_icon_style(color, font_active))
+            
+            tint_icon_ref = live_refs.get("tint_icon")
+            if tint_icon_ref:
+                tint_style_active = bool(self.container.preferences_service.get(f"reader_character_tint_enabled:{active.fandom_key}:{character.id}", False))
+                tint_color = self.container.preferences_service.get(f"reader_character_tint_color:{active.fandom_key}:{character.id}", color)
+                tint_icon_ref.style(replace=character_tint_icon_style(color, tint_style_active, tint_color))
+                
+            self._save_character_from_draft(active, draft, character.id, notify=False)
+            rerender_callback()
+
+        with ui.element("div").classes("soft-panel w-full p-2 character-profile-expanded").style(expanded_style).on(
+            "click.stop",
+            lambda _=None: None,
+        ) as expanded_panel:
+            live_refs["expanded"] = expanded_panel
+            with ui.row().classes("w-full items-center gap-2"):
+                live_refs["avatar"] = self._character_avatar_button(
+                    character.id,
+                    display_name,
+                    character.avatar_url,
+                    character.color,
+                    rerender_callback,
+                    active.fandom_key,
+                )
+                name_field = ui.input("Name", value=draft["name"]).bind_value(draft, "name").props(
+                    "dark outlined dense"
+                ).classes("w-32")
+                name_field.on("blur", lambda _=None: autosave())
+                
+                full_name_field = ui.input("Full Name", value=draft["full_name"]).bind_value(draft, "full_name").props(
+                    "dark outlined dense"
+                ).classes("flex-grow")
+                full_name_field.on("blur", lambda _=None: autosave())
+
+                def _update_btn_style(btn, t, c):
+                    btn.set_text(t.upper())
+                    base_color = normalized_label_color(c)
+                    if t.isupper():
+                        btn.style(f"color: {base_color} !important; border-color: {base_color} !important; opacity: 1;")
+                    else:
+                        btn.style("color: #64748b !important; border-color: #334155 !important; opacity: 0.6;")
+
+                def _toggle_g(_=None, d=draft, cid=character.id, btn=None, color=character.color):
+                    t = d.get("pronoun_type") or "f"
+                    nxt = {"F": "M", "M": "F", "f": "m", "m": "f"}.get(t, "f")
+                    d["pronoun_type"] = nxt
+                    _update_btn_style(btn, nxt, color)
+                    autosave()
+
+                def _toggle_a(_=None, d=draft, cid=character.id, btn=None, color=character.color):
+                    t = d.get("pronoun_type") or "f"
+                    nxt = {"F": "f", "M": "m", "f": "F", "m": "M"}.get(t, "f")
+                    d["pronoun_type"] = nxt
+                    _update_btn_style(btn, nxt, color)
+                    autosave()
+
+                p_btn = ui.button(draft.get("pronoun_type", "f").upper()).props("outline dense").classes("w-10 px-0")
+                _update_btn_style(p_btn, draft.get("pronoun_type", "f"), character.color)
+                p_btn.on("click", lambda _=None: _toggle_g(None, draft, character.id, p_btn, character.color))
+                p_btn.on("contextmenu.prevent", lambda _=None: _toggle_a(None, draft, character.id, p_btn, character.color))
+                with p_btn:
+                    rich_tooltip("Left-click: F/M, Right-click: ON/OFF", character.color)
+                
+                color_field = ui.color_input(
+                    "Color",
+                    value=draft["color"],
+                    on_change=lambda event: update_color_live(getattr(event, "value", None)),
+                ).bind_value(draft, "color").props("dark outlined dense").classes("w-32")
+                
+                font_style_active = bool(draft["reader_style"].get("custom_font_enabled") or draft["reader_style"].get("font_size_enabled"))
+                font_icon = ui.icon("text_fields", size="sm").classes("character-font-icon cursor-pointer px-1")
+                live_refs["font_icon"] = font_icon
+                font_icon.style(character_font_icon_style(character.color, font_style_active))
+                font_icon.on("click.stop", lambda _=None: self._open_character_font_dialog(active, character, rerender_callback))
+                with font_icon:
+                    rich_tooltip("Character reader font", character.color)
+                    
+                tint_style_active = bool(self.container.preferences_service.get(f"reader_character_tint_enabled:{active.fandom_key}:{character.id}", False))
+                tint_color = self.container.preferences_service.get(f"reader_character_tint_color:{active.fandom_key}:{character.id}", character.color)
+                tint_icon = ui.icon("colorize", size="sm").classes("character-tint-icon cursor-pointer px-1")
+                live_refs["tint_icon"] = tint_icon
+                tint_icon.style(character_tint_icon_style(character.color, tint_style_active, tint_color))
+                tint_icon.on("click.stop", lambda _=None: self._open_character_tint_dialog(active, character, rerender_callback))
+                with tint_icon:
+                    rich_tooltip("Dialogue tint color", character.color)
+                    
+            with ui.element("div").classes("w-full character-tag-suggestion-shell"):
+                tag_input = ui.input("Canonical AO3 character tag URL", value=draft["tag_urls"]).bind_value(draft, "tag_urls").props(
+                    "dark outlined dense"
+                ).classes("w-full")
+                tag_input.on("blur", lambda _=None: autosave())
+                suggestions_row = ui.row().classes("w-full gap-1 flex-wrap character-tag-suggestions hidden")
+
+            def render_edit_suggestions(event=None, ch_draft=draft, row=suggestions_row, char_color=character.color) -> None:
+                row.clear()
+                raw_query = self._input_event_text(event, ch_draft.get("tag_urls") or "")
+                if event is not None:
+                    ch_draft["tag_urls"] = raw_query
+                query = raw_query.strip()
+                if not query:
+                    row.classes(add="hidden")
+                    return
+                suggestions = _canonical_character_suggestions(
+                    self.container.fandom_service.tag_suggestions(active.fandom_key, query, 24, category="character"),
+                    query,
+                )[:12]
+                if not suggestions:
+                    row.classes(add="hidden")
+                    return
+                row.classes(remove="hidden")
+                with row:
+                    for suggestion in suggestions:
+                        suggestion_label = _ao3_character_tag_label(suggestion.tag_url or suggestion.tag_text)
+                        
+                        def use_suggestion(s=suggestion, d=ch_draft, cid=character.id):
+                            d["tag_urls"] = s.tag_url or s.tag_text
+                            autosave()
+                            tag_input.set_value(s.tag_url or s.tag_text)
+                            row.classes(add="hidden")
+                            rerender_callback()
+                            
+                        pill = ui.button(
+                            suggestion_label,
+                            on_click=use_suggestion,
+                        ).props("dense rounded flat")
+                        pill.classes("max-w-full")
+                        pill.style(
+                            f"border: 1px solid rgba({','.join(str(v) for v in rgb_from_hex(char_color))},0.32); "
+                            f"color: {normalized_label_color(char_color)} !important; overflow: hidden; text-overflow: ellipsis;"
+                        )
+                        with pill:
+                            rich_tooltip("character", char_color)
+
+            tag_input.on("keyup", lambda event=None: render_edit_suggestions(event), js_handler=character_tag_suggestion_js())
+            tag_input.on("input", lambda event=None: render_edit_suggestions(event), js_handler=character_tag_suggestion_js())
+
     def _reader_character_pool_reset(self, work_id: str, chapter_index: int) -> bool:
         return bool(self.container.preferences_service.get(self._reader_character_pool_reset_key(work_id, chapter_index), False))
 
     def _reader_no_pov_enabled(self, work_id: str) -> bool:
         return bool(self.container.preferences_service.get(self._reader_no_pov_key(work_id), False))
+
+    async def _run_dam_analysis(self, work_id: str, chapter_idx: int, chapter_html: str, fandom_key: str, pov_character_id: str | None = None) -> None:
+        """Run DAM analysis in background thread, then re-render."""
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: self.container.dam_service.run_attribution(work_id, chapter_idx, chapter_html, fandom_key, pov_character_id),
+        )
+        if not result.ok:
+            ui.notify(result.message, type="warning", position="bottom")
+        else:
+            ui.notify(result.message, type="positive", position="bottom")
+        self._render_right()
+        self._render_center()
+
+    @staticmethod
+    def _reader_dam_enabled_key(work_id: str) -> str:
+        return f"reader_dam_enabled:{work_id}"
+
+    def _reader_dam_enabled(self, work_id: str) -> bool:
+        return bool(self.container.preferences_service.get(self._reader_dam_enabled_key(work_id), False))
+
+    @staticmethod
+    def _reader_dam_narration_tint_key(work_id: str) -> str:
+        return f"reader_dam_narration_tint:{work_id}"
+
+    def _reader_dam_narration_tint_enabled(self, work_id: str) -> bool:
+        return bool(self.container.preferences_service.get(self._reader_dam_narration_tint_key(work_id), False))
+
+    def _reader_dam_reverse_narration_tint_enabled(self) -> bool:
+        return bool(self.container.preferences_service.get("reader_dam_reverse_narration_tint", False))
+
+    def _set_reader_dam_reverse_narration_tint(self, value: bool) -> None:
+        self.container.preferences_service.set("reader_dam_reverse_narration_tint", value)
+
+    @staticmethod
+    def _reader_dam_italics_enabled_key(work_id: str) -> str:
+        return f"reader_dam_italics_enabled:{work_id}"
+
+    def _reader_dam_italics_enabled(self, work_id: str) -> bool:
+        return bool(self.container.preferences_service.get(self._reader_dam_italics_enabled_key(work_id), True))
 
     def _reader_character_view_committed(self, work_id: str, chapter_index: int) -> bool:
         if self._reader_character_list_committed(work_id, chapter_index):
@@ -6389,8 +7420,29 @@ class AO3StudioShell:
     def _open_reader(self, work_id: str) -> None:
         self.selected_work_id = work_id
         self.container.preferences_service.set("selected_work_id", work_id)
-        self.container.preferences_service.set("reader_work_id", work_id)
-        self._set_page("Read")
+        
+        fandom_key = self._find_fandom_for_work(work_id)
+        active = self._active_fandom()
+        
+        if fandom_key and fandom_key != active.fandom_key:
+            self._persist_fandom_page()
+            profile = self.container.fandom_service.select(fandom_key)
+            state = self._browse_filter_state()
+            self.container.preferences_service.set("browse_filter_state", state)
+            self.container.preferences_service.set("last_context_type", "fandom")
+            self.container.preferences_service.set("last_context_key", profile.tag)
+            
+            self.container.preferences_service.set(self._reader_work_id_key(profile.fandom_key), work_id)
+            self.page = "Read"
+            self.container.preferences_service.set("active_page", "Read")
+            self._persist_fandom_page("Read")
+        else:
+            self.container.preferences_service.set(self._reader_work_id_key(active.fandom_key), work_id)
+            self.page = "Read"
+            self.container.preferences_service.set("active_page", "Read")
+            self._persist_fandom_page("Read")
+            
+        self.refresh()
 
     def _purge_uncollected_cache(self, keep_work_ids: list[str] | None = None) -> None:
         result = self.container.work_library_service.purge_uncollected_cache(keep_work_ids)
@@ -6675,6 +7727,7 @@ class AO3StudioShell:
             ui.textarea("Notes", value=note_state["notes"]).bind_value(note_state, "notes").props("outlined dense dark").classes(
                 "w-full mt-3"
             )
+
         evaluations = self.container.evaluation_service.list_for_work(work.work_id)
         if evaluations:
             ui.label("Evaluation History").classes("text-sm font-bold")
@@ -6708,7 +7761,7 @@ class AO3StudioShell:
         self.refresh()
 
     def _page_read(self) -> None:
-        work_id = str(self.container.preferences_service.get("reader_work_id", "") or self.selected_work_id or "")
+        work_id = self._get_reader_work_id()
         if not work_id:
             with ui.column().classes("reader-stage w-full h-full min-h-0"):
                 self._empty("menu_book", "Select a work title from Browse, Works, or Queue")
@@ -6747,10 +7800,60 @@ class AO3StudioShell:
                                     characters,
                                     chapter.html,
                                 )
-                                rendered = _reader_highlight_characters(chapter.html, characters)
-                                rendered = _reader_apply_pov_paragraph_colors(
+                                rendered = chapter.html
+                                if not self._show_author_notes_enabled():
+                                    soup = BeautifulSoup(rendered, "lxml")
+                                    for node in soup.select("#chapter-preface-notes, #chapter-end-notes, #chapter-summary"):
+                                        node.decompose()
+                                    rendered = str((soup.body or soup).decode_contents())
+                                # ── DAM paragraph coloring or standard POV ──
+                                disable_name_color = bool(self.container.preferences_service.get(f"reader_disable_name_color:{active.fandom_key}", False))
+                                disable_name_glow = bool(self.container.preferences_service.get(f"reader_disable_name_glow:{active.fandom_key}", False))
+                                dialogue_style = self.container.preferences_service.get(f"reader_dialogue_style:{active.fandom_key}", "none")
+                                dam_enabled = self._reader_dam_enabled(work.work_id)
+                                dam_applied = False
+                                if dam_enabled:
+                                    dam_status = self.container.dam_service.get_dam_status(work.work_id, chapter_index)
+                                    if dam_status == "complete":
+                                        dam_attribs = self.container.dam_service.get_attributions(work.work_id, chapter_index)
+                                        if dam_attribs:
+                                            narration_tint = self._reader_dam_narration_tint_enabled(work.work_id)
+                                            italics_enabled = self._reader_dam_italics_enabled(work.work_id)
+                                            custom_tints_enabled = {}
+                                            custom_tint_colors = {}
+                                            for c in characters:
+                                                custom_tints_enabled[c.id] = bool(self.container.preferences_service.get(
+                                                    f"reader_character_tint_enabled:{active.fandom_key}:{c.id}", False
+                                                ))
+                                                custom_tint_colors[c.id] = str(self.container.preferences_service.get(
+                                                    f"reader_character_tint_color:{active.fandom_key}:{c.id}", c.color
+                                                ) or c.color)
+                                            rendered = _reader_apply_dam_paragraph_colors(
+                                                rendered,
+                                                dam_attribs,
+                                                characters,
+                                                selected_character.color if selected_character else None,
+                                                narration_tint,
+                                                italics_enabled,
+                                                pov_character_id=selected_character.id if selected_character else None,
+                                                reverse_narration_tint=self._reader_dam_reverse_narration_tint_enabled(),
+                                                dialogue_style=dialogue_style,
+                                                custom_tints_enabled=custom_tints_enabled,
+                                                custom_tint_colors=custom_tint_colors,
+                                            )
+                                            dam_applied = True
+                                if not dam_applied:
+                                    rendered = _reader_apply_pov_paragraph_colors(
+                                        rendered,
+                                        selected_character.color if selected_character else None,
+                                    )
+                                # Character highlight must run AFTER DAM/POV so quote text isn't split
+                                # _reader_highlight_characters(rendered, characters)
+                                rendered = _reader_highlight_characters(
                                     rendered,
-                                    selected_character.color if selected_character else None,
+                                    characters,
+                                    disable_name_color=disable_name_color,
+                                    disable_name_glow=disable_name_glow,
                                 )
                                 prose_style = html.escape(self._reader_font_style_for_character(style_settings, selected_character), quote=True)
                                 ui.html(
@@ -6762,11 +7865,14 @@ class AO3StudioShell:
                             else:
                                 self._empty("menu_book", result.message or "No reader content downloaded yet")
                         if chapter and result.scroll_percent:
-                            ui.timer(0.01, lambda s=reader_scroll, p=float(result.scroll_percent): self._restore_reader_scroll(s, p), once=True)
+                            _scroll_t = ui.timer(0.01, lambda s=reader_scroll, p=float(result.scroll_percent): self._restore_reader_scroll(s, p), once=True)
+                            self._reader_scroll_timers.append(_scroll_t)
 
     def _set_reader_chapter(self, work_id: str, chapter_index: int) -> None:
+        active = self._active_fandom()
+        self.dam_trash_armed_chapter = None
         self.container.reader_service.set_position(work_id, max(1, chapter_index), 0.0)
-        self.container.preferences_service.set("reader_work_id", work_id)
+        self.container.preferences_service.set(self._reader_work_id_key(active.fandom_key), work_id)
         self.refresh()
 
     def _save_reader_scroll_position(self, work_id: str, chapter_index: int, event: Any) -> None:
@@ -6777,15 +7883,20 @@ class AO3StudioShell:
         self.container.reader_service.set_position(work_id, max(1, int(chapter_index or 1)), percent)
 
     def _restore_reader_scroll(self, scroll_area: Any, percent: float) -> None:
-        scroll_area.scroll_to(percent=max(0.0, min(1.0, float(percent or 0.0))), duration=0.0)
-        ui.timer(0.035, lambda s=scroll_area: s.classes(remove="reader-scroll-restoring"), once=True)
+        try:
+            scroll_area.scroll_to(percent=max(0.0, min(1.0, float(percent or 0.0))), duration=0.0)
+            _t = ui.timer(0.035, lambda s=scroll_area: s.classes(remove="reader-scroll-restoring"), once=True)
+            self._reader_scroll_timers.append(_t)
+        except RuntimeError:
+            return
 
     def _start_reader_download(self, work_id: str, *, force: bool = False, rerender: bool = True) -> None:
         if self._reader_download_inflight and not force:
             return
+        active = self._active_fandom()
         client = self._current_client()
         self._reader_download_inflight = work_id
-        self.container.preferences_service.set("reader_work_id", work_id)
+        self.container.preferences_service.set(self._reader_work_id_key(active.fandom_key), work_id)
         self._notify("Downloading AO3 reader HTML.", "info", client=client)
         background_tasks.create(self._reader_download_background(work_id, client), name="ao3-reader-download")
         if rerender:
@@ -7075,7 +8186,7 @@ class AO3StudioShell:
             )
             with card:
                 self._attach_rarity_context_menu(work.work_id, active.color)
-                with ui.row().classes("work-card-actions items-center gap-0"):
+                with ui.row().classes("work-card-actions items-center gap-1"):
                     has_left_action = False
                     if browse_actions and not is_collected:
                         collect = ui.button(icon="bookmark_add").props("round flat dense size=md").classes("work-action-button")
@@ -7108,8 +8219,6 @@ class AO3StudioShell:
                             with kept:
                                 rich_tooltip("Already in Works", active.color)
                         has_left_action = True
-                    if has_left_action and show_queue_action:
-                        ui.label("|").classes("action-separator")
                     if show_queue_action:
                         queue = ui.button(icon="playlist_add").props("round flat dense size=md").classes("work-action-button")
                         queue.style(f"color: {normalized_label_color(active.color) if is_queued else '#6b7280'} !important;")
@@ -7120,8 +8229,8 @@ class AO3StudioShell:
                         )
                         with queue:
                             rich_tooltip("Choose evaluation queue", active.color)
+
                     if browse_actions and not has_assigned_rarity:
-                        ui.label("|").classes("action-separator")
                         armed = self.block_armed_work_id == work.work_id
                         block = ui.button(icon="visibility_off").props("round flat dense size=md").classes("work-action-button")
                         block.style(f"color: {'#ef4444' if armed else '#6b7280'} !important;")
@@ -7394,7 +8503,10 @@ class AO3StudioShell:
     def _chapter_word_count_label(chapter_html: str) -> str:
         if not chapter_html:
             return "0 words"
-        text = BeautifulSoup(chapter_html, "lxml").get_text(" ")
+        soup = BeautifulSoup(chapter_html, "lxml")
+        for node in soup.select("#chapter-preface-notes, #chapter-end-notes, #chapter-summary"):
+            node.decompose()
+        text = soup.get_text(" ")
         count = len(re.findall(r"\b[\w'-]+\b", text))
         return f"{count:,} words"
 
@@ -9177,6 +10289,7 @@ class AO3StudioShell:
             "lm_timeout": model_config["timeout_seconds"],
             "lm_temperature": model_config["temperature"],
             "lm_context_length": model_config.get("context_length", 0),
+            "lm_auto_unload": model_config.get("auto_unload", False),
             "lm_models": [],
             "lm_models_message": "",
             "remote_api_base_url": self.container.identity_service.remote_identity().api_base_url,
@@ -9218,6 +10331,7 @@ class AO3StudioShell:
                     timeout_seconds=int(settings_state["lm_timeout"] or 180),
                     temperature=float(settings_state["lm_temperature"] or 0.2),
                     context_length=settings_state.get("lm_context_length", 0),
+                    auto_unload=bool(settings_state.get("lm_auto_unload", False)),
                 )
                 self.container.work_library_service.save_browse_cache_policy(
                     {
@@ -9401,10 +10515,16 @@ class AO3StudioShell:
                     display = str(item.get("display_name") or key)
                     loaded = bool(item.get("loaded_instances"))
                     selected = key == str(state.get("lm_model") or "")
-                    pill = ui.button(display, icon="memory" if loaded else "radio_button_unchecked").props("dense rounded no-caps")
+                    icon_name = "memory" if loaded else ("radio_button_checked" if selected else "radio_button_unchecked")
+                    pill = ui.button(display, icon=icon_name).props("dense rounded no-caps")
                     pill.classes("filter-favorite-pill")
                     pill.style(self._filter_pill_style("#7ee787" if loaded else accent, selected))
-                    pill.on("click.stop", lambda _=None, model_key=key: state.update({"lm_model": model_key}))
+
+                    def select_model(model_key=key):
+                        state["lm_model"] = model_key
+                        render_models()
+
+                    pill.on("click.stop", lambda _=None, model_key=key: select_model(model_key))
                     with pill:
                         rich_tooltip("Loaded" if loaded else "Available", "#7ee787" if loaded else accent)
 
@@ -9454,6 +10574,10 @@ class AO3StudioShell:
                     state,
                     "lm_context_length",
                 ).props("outlined dense dark").classes("w-40")
+                ui.switch("Auto-unload", value=state["lm_auto_unload"]).bind_value(
+                    state,
+                    "lm_auto_unload",
+                )
             with ui.row().classes("w-full items-center gap-2"):
                 refresh = ui.button("Refresh Models", icon="list", on_click=refresh_models).props("flat dense no-caps")
                 refresh.style(f"color: {normalized_label_color(accent)} !important;")
@@ -10099,7 +11223,12 @@ def _reader_visible_characters_for_chapter(
     return [character for character in characters if character.id in visible_ids]
 
 
-def _reader_highlight_characters(fragment: str, characters: list[Any]) -> str:
+def _reader_highlight_characters(
+    fragment: str,
+    characters: list[Any],
+    disable_name_color: bool = False,
+    disable_name_glow: bool = False,
+) -> str:
     names: dict[str, str] = {}
     for character in characters:
         color = str(getattr(character, "color", "") or "#58a6ff")
@@ -10114,6 +11243,15 @@ def _reader_highlight_characters(fragment: str, characters: list[Any]) -> str:
     )
     lookup = {name.lower(): color for name, color in names.items()}
     soup = BeautifulSoup(fragment, "lxml")
+    body = soup.body or soup
+
+    preface_node = body.find(id="chapter-preface-notes")
+    if preface_node:
+        preface_node = preface_node.extract()
+    end_notes_node = body.find(id="chapter-end-notes")
+    if end_notes_node:
+        end_notes_node = end_notes_node.extract()
+
     for node in list(soup.find_all(string=True)):
         if not isinstance(node, NavigableString) or node.parent and node.parent.name in {"script", "style"}:
             continue
@@ -10127,13 +11265,31 @@ def _reader_highlight_characters(fragment: str, characters: list[Any]) -> str:
             base = match.group(1)
             matched = match.group(0)
             color = lookup.get(base.lower(), "#58a6ff")
-            style = glow_text(color, 6)
-            parts.append(f'<span style="{html.escape(style, quote=True)}">{html.escape(matched)}</span>')
+            
+            style_parts = []
+            if not disable_name_color:
+                style_parts.append(f"color: {normalized_label_color(color)};")
+                if not disable_name_glow:
+                    style_parts.append(
+                        "text-shadow: 0 0 1px rgba(0,0,0,1), 0 1px 2px rgba(0,0,0,0.9), "
+                        f"0 0 4px rgba(0,0,0,0.7), 0 0 6px {normalized_label_color(color)};"
+                    )
+            
+            if style_parts:
+                style = " ".join(style_parts)
+                parts.append(f'<span style="{html.escape(style, quote=True)}">{html.escape(matched)}</span>')
+            else:
+                parts.append(html.escape(matched))
             last = match.end()
         parts.append(html.escape(text[last:]))
         replacement = BeautifulSoup("".join(parts), "html.parser")
         node.replace_with(*list((replacement.body or replacement).contents))
-    body = soup.body or soup
+
+    if preface_node:
+        body.insert(0, preface_node)
+    if end_notes_node:
+        body.append(end_notes_node)
+
     return str(body.decode_contents())
 
 
@@ -10148,6 +11304,14 @@ def _reader_apply_pov_paragraph_colors(fragment: str, pov_color: str | None) -> 
         color_b = "#dde3ea"
     soup = BeautifulSoup(fragment, "lxml")
     body = soup.body or soup
+    
+    preface_node = body.find(id="chapter-preface-notes")
+    if preface_node:
+        preface_node = preface_node.extract()
+    end_notes_node = body.find(id="chapter-end-notes")
+    if end_notes_node:
+        end_notes_node = end_notes_node.extract()
+        
     blocks: list[Any] = []
     for node in body.find_all(["p", "blockquote", "div"]):
         if node.name == "div" and node.find(["p", "blockquote", "div"]):
@@ -10159,7 +11323,260 @@ def _reader_apply_pov_paragraph_colors(fragment: str, pov_color: str | None) -> 
         existing = str(node.get("style") or "").strip()
         separator = "" if not existing or existing.endswith(";") else "; "
         node["style"] = f"{existing}{separator}color: {color};"
+        
+    if preface_node:
+        body.insert(0, preface_node)
+    if end_notes_node:
+        body.append(end_notes_node)
+        
     return str(body.decode_contents())
+
+
+def _reader_apply_dam_paragraph_colors(
+    fragment: str,
+    attributions: list[dict],
+    characters: list[Any],
+    pov_color: str | None,
+    narration_tint: bool,
+    italics_enabled: bool = True,
+    pov_character_id: str | None = None,
+    reverse_narration_tint: bool = False,
+    dialogue_style: str = "none",
+    custom_tints_enabled: dict[str, bool] | None = None,
+    custom_tint_colors: dict[str, str] | None = None,
+) -> str:
+    """Apply narration tint to all paragraphs, then inject vibrant spans for quoted dialogue only.
+
+    All paragraphs receive narration colouring (neutral grey or POV alternating).
+    Quoted dialogue text is wrapped in inline spans with the speaker's vibrant colour,
+    overriding the paragraph colour for just that text.
+    """
+    from bs4 import NavigableString
+
+    if not fragment:
+        return fragment
+    char_color: dict[str, str] = {character.id: character.color for character in characters}
+
+    # Build pid → attribution list
+    by_pid: dict[int, list[dict]] = {}
+    for attr in attributions:
+        if not italics_enabled and attr.get("is_italics"):
+            continue
+        pid = int(attr.get("pid", -1))
+        speaker = str(attr.get("speaker_id", ""))
+        quote = str(attr.get("quote_text", ""))
+        if pid >= 0 and speaker and quote:
+            by_pid.setdefault(pid, []).append(attr)
+
+    # Narration colours (applied to ALL paragraphs as the base)
+    if narration_tint and pov_color and pov_color != "#e0e0e0":
+        narr_a = _scriptstudio_lighten_color(pov_color, 0.45)
+        narr_b = _scriptstudio_lighten_color(pov_color, 0.65)
+    else:
+        narr_a = "#c9d1d9"
+        narr_b = "#dde3ea"
+
+    soup = BeautifulSoup(fragment, "lxml")
+    body = soup.body or soup
+    
+    preface_node = body.find(id="chapter-preface-notes")
+    if preface_node:
+        preface_node = preface_node.extract()
+    end_notes_node = body.find(id="chapter-end-notes")
+    if end_notes_node:
+        end_notes_node = end_notes_node.extract()
+        
+    blocks: list[Any] = []
+    for node in body.find_all(["p", "blockquote", "div"]):
+        if node.name == "div" and node.find(["p", "blockquote", "div"]):
+            continue
+        if node.get_text(" ", strip=True):
+            blocks.append(node)
+
+    for index, node in enumerate(blocks):
+        # Step 1 — narration colour on the whole paragraph
+        narr_color = narr_a if index % 2 == 0 else narr_b
+        existing = str(node.get("style") or "").strip()
+        separator = "" if not existing or existing.endswith(";") else "; "
+        node["style"] = f"{existing}{separator}color: {narr_color};"
+
+        # Step 2 — inject vibrant spans for each quoted dialogue in this paragraph
+        if index in by_pid:
+            for attr in by_pid[index]:
+                quote = str(attr.get("quote_text", ""))
+                speaker = str(attr.get("speaker_id", ""))
+                if not quote:
+                    continue
+
+                custom_enabled = custom_tints_enabled.get(speaker, False) if custom_tints_enabled else False
+                if custom_enabled:
+                    raw_color = custom_tint_colors.get(speaker, char_color.get(speaker, "#94a3b8")) if custom_tint_colors else char_color.get(speaker, "#94a3b8")
+                else:
+                    raw_color = char_color.get(speaker, "#94a3b8")
+
+                use_name_style = False
+                if dialogue_style == "all":
+                    use_name_style = True
+                elif dialogue_style == "pov" and pov_character_id and speaker == pov_character_id:
+                    use_name_style = True
+
+                style_str = None
+                if use_name_style:
+                    color = normalized_label_color(raw_color)
+                    style_str = (
+                        f"color: {color}; "
+                        "text-shadow: 0 0 1px rgba(0,0,0,1), 0 1px 2px rgba(0,0,0,0.9), "
+                        f"0 0 4px rgba(0,0,0,0.7), 0 0 6px {color};"
+                    )
+
+                if reverse_narration_tint and pov_character_id and speaker == pov_character_id:
+                    vibrant = "#c9d1d9" if index % 2 == 0 else "#dde3ea"
+                else:
+                    vibrant = _scriptstudio_lighten_color(raw_color, 0.25)
+                
+                _dam_inject_quote_span(node, quote, vibrant, soup, preview_mode=True, style_str=style_str)
+
+    if preface_node:
+        body.insert(0, preface_node)
+    if end_notes_node:
+        body.append(end_notes_node)
+
+    return str(body.decode_contents())
+
+
+def _reader_inject_dam_spans(
+    fragment: str,
+    attributions: list[dict],
+    characters: list[Any],
+) -> str:
+    """Wrap dialogue quotes in <span class="dam" style="--dam-c:{color}"> tags."""
+    if not fragment or not attributions:
+        return fragment
+    char_color: dict[str, str] = {character.id: character.color for character in characters}
+    by_pid: dict[int, list[dict]] = {}
+    for attr in attributions:
+        pid = int(attr.get("pid", -1))
+        if pid >= 0 and attr.get("speaker_id") and attr.get("quote_text"):
+            by_pid.setdefault(pid, []).append(attr)
+    if not by_pid:
+        return fragment
+    soup = BeautifulSoup(fragment, "lxml")
+    body = soup.body or soup
+    blocks: list[Any] = []
+    for node in body.find_all(["p", "blockquote", "div"]):
+        if node.name == "div" and node.find(["p", "blockquote", "div"]):
+            continue
+        if node.get_text(" ", strip=True):
+            blocks.append(node)
+    for pid, attrs in by_pid.items():
+        if pid >= len(blocks):
+            continue
+        node = blocks[pid]
+        for attr in attrs:
+            quote = str(attr.get("quote_text", ""))
+            speaker = str(attr.get("speaker_id", ""))
+            color = char_color.get(speaker, "#94a3b8")
+            if not quote:
+                continue
+            _dam_inject_quote_span(node, quote, color, soup, preview_mode=False)
+    return str(body.decode_contents())
+
+
+def _dam_inject_quote_span(
+    node: Any,
+    quote: str,
+    color: str,
+    soup: Any,
+    preview_mode: bool = False,
+    style_str: str | None = None,
+) -> None:
+    """Find and wrap a substring in node's text nodes with a coloured DAM span.
+    Handles quotes that span across multiple HTML inline tags and whitespace
+    artifacts from get_text(' ') by using regex-based fuzzy matching.
+    """
+    import re
+    from bs4 import NavigableString
+
+    def _norm_char(c: str) -> str:
+        if c in '\u201c\u201d': return '"'
+        if c in '\u2018\u2019': return "'"
+        return c.lower()
+
+    # Collect all text nodes in document order
+    text_nodes: list[NavigableString] = []
+    def _collect(element: Any) -> None:
+        for child in element.children:
+            if isinstance(child, NavigableString):
+                if child.parent and child.parent.name == "span" and "dam" in (child.parent.get("class") or []):
+                    continue
+                text_nodes.append(child)
+            elif hasattr(child, 'children'):
+                _collect(child)
+    _collect(node)
+    if not text_nodes:
+        return
+
+    # Build the joined plain text from the DOM
+    full_text = "".join(str(n) for n in text_nodes)
+    norm_full = "".join(_norm_char(c) for c in full_text)
+
+    # Build a regex from the quote that treats any whitespace run as \s*
+    # This handles the extra spaces get_text(" ") injects at tag boundaries
+    norm_quote = "".join(_norm_char(c) for c in quote)
+    # Split on whitespace, escape each token, rejoin with \s* (zero or more)
+    tokens = norm_quote.split()
+    if not tokens:
+        return
+    pattern = r"\s*".join(re.escape(t) for t in tokens)
+    m = re.search(pattern, norm_full)
+    if not m:
+        return
+
+    start_idx = m.start()
+    end_idx = m.end()
+
+    # Walk text nodes and wrap the overlapping portions
+    current_idx = 0
+    for child in text_nodes:
+        text = str(child)
+        node_start = current_idx
+        node_end = current_idx + len(text)
+        current_idx = node_end
+
+        overlap_start = max(node_start, start_idx)
+        overlap_end = min(node_end, end_idx)
+
+        if overlap_start < overlap_end:
+            local_start = overlap_start - node_start
+            local_end = overlap_end - node_start
+
+            before = text[:local_start]
+            matched = text[local_start:local_end]
+            after = text[local_end:]
+
+            span = soup.new_tag("span")
+            if preview_mode:
+                if style_str is not None:
+                    span["style"] = style_str
+                else:
+                    span["style"] = f"color: {color};"
+            else:
+                span["class"] = "dam"
+                span["style"] = f"--dam-c: {color};"
+            span.string = matched
+
+            parts: list[Any] = []
+            if before:
+                parts.append(NavigableString(before))
+            parts.append(span)
+            if after:
+                parts.append(NavigableString(after))
+
+            child.replace_with(parts[0])
+            ref = parts[0]
+            for part in parts[1:]:
+                ref.insert_after(part)
+                ref = part
 
 
 def _scriptstudio_lighten_color(hex_color: str, amount: float = 0.3) -> str:

@@ -428,13 +428,22 @@ def parse_reader_html(
         for ref in chapter_refs or []
         if ref.chapter_number and ref.label and not _is_generic_chapter_title(ref.label, ref.chapter_number)
     }
-    for index, node in enumerate(_reader_chapter_nodes(soup), start=1):
+    for index, item in enumerate(_reader_chapter_nodes(soup), start=1):
+        node = item["node"]
         title = _reader_chapter_title(node, index)
         if _is_generic_chapter_title(title, index) and index in ref_titles:
             title = ref_titles[index]
         anchor = str(node.get("id") or f"chapter-{index}") if isinstance(node, Tag) else f"chapter-{index}"
         body = _reader_chapter_body(node)
-        clean_html = _sanitize_reader_html(body)
+        clean_body = _sanitize_reader_html(body)
+        
+        preface_notes = item.get("preface_html", "")
+        end_notes = item.get("endnotes_html", "")
+        
+        preface_formatted = f'<div id="chapter-preface-notes">{preface_notes}<hr/></div>' if preface_notes else ""
+        endnotes_formatted = f'<div id="chapter-end-notes"><hr/>{end_notes}</div>' if end_notes else ""
+        
+        clean_html = f"{preface_formatted}{clean_body}{endnotes_formatted}"
         text_hash = hashlib.sha256(BeautifulSoup(clean_html, "lxml").get_text(" ", strip=True).encode("utf-8")).hexdigest()
         chapters.append(
             ReaderChapter(
@@ -587,27 +596,145 @@ def quote_for_tag(tag: str) -> str:
     return quote(tag, safe="")
 
 
-def _reader_chapter_nodes(soup: BeautifulSoup) -> list[Tag]:
+def _format_meta_section(meta_node: Tag) -> str:
+    """Format the summary and notes from a meta div."""
+    parts = []
+    current_label = ""
+    for child in meta_node.descendants:
+        if not isinstance(child, Tag):
+            continue
+        if child.name in ("p", "h2", "h3", "h4", "h5", "h6"):
+            text = child.get_text(" ", strip=True).lower()
+            if "summary" in text:
+                current_label = "Summary"
+            elif "notes" in text and "end" not in text:
+                current_label = "Notes"
+            elif "end notes" in text or "endnotes" in text:
+                current_label = "End Notes"
+        if child.name == "blockquote" and "userstuff" in child.get("class", []):
+            content_html = _sanitize_reader_html(str(child))
+            if content_html:
+                label_html = f"<p><strong>{current_label}:</strong></p>" if current_label else ""
+                parts.append(f"{label_html}{content_html}")
+                current_label = ""
+    if not parts:
+        txt = meta_node.get_text(" ", strip=True)
+        if txt and not any(l in txt.lower() for l in ("see the end of the chapter for notes", "chapter notes", "chapter summary", "chapter end notes")):
+            cleaned = _sanitize_reader_html(str(meta_node))
+            if cleaned:
+                parts.append(cleaned)
+    return "".join(parts)
+
+
+def _reader_chapter_nodes(soup: BeautifulSoup) -> list[dict[str, Any]]:
     candidates = [
         node
         for node in soup.select("#chapters .chapter, .chapter, section.chapter, article.chapter")
         if isinstance(node, Tag) and _text(node)
     ]
-    if candidates:
-        return candidates
-    userstuff = [
-        node
-        for node in soup.select("#chapters .userstuff, #workskin .userstuff")
-        if isinstance(node, Tag) and _text(node)
-    ]
-    if len(userstuff) > 1:
-        return userstuff
+    filtered_candidates = []
+    for node in candidates:
+        if not any(ancestor in candidates for ancestor in node.parents):
+            filtered_candidates.append(node)
+            
+    if filtered_candidates:
+        results = []
+        for container in filtered_candidates:
+            body_node = container.select_one(".userstuff") or container
+            preface_nodes = []
+            endnotes_nodes = []
+            for note_node in container.select(".preface, .notes, [id*='notes'], .meta"):
+                if note_node == body_node or body_node in note_node.parents:
+                    continue
+                if not note_node.get_text(" ", strip=True):
+                    continue
+                classes = note_node.get("class", [])
+                tag_id = note_node.get("id", "")
+                is_end = "end" in tag_id or "afterword" in tag_id or "endnotes" in tag_id
+                if body_node in note_node.previous_elements:
+                    is_end = True
+                if is_end:
+                    endnotes_nodes.append(note_node)
+                else:
+                    preface_nodes.append(note_node)
+                    
+            preface_html = "".join(_format_meta_section(n) for n in preface_nodes)
+            endnotes_html = "".join(_format_meta_section(n) for n in endnotes_nodes)
+            results.append({
+                "node": container,
+                "preface_html": preface_html,
+                "endnotes_html": endnotes_html,
+            })
+        return results
+
+    chapters_div = soup.select_one("#chapters") or soup.select_one("#workskin")
+    if chapters_div:
+        chapters = []
+        pending_preface = []
+        current_chapter = None
+        
+        for child in chapters_div.children:
+            if not isinstance(child, Tag):
+                continue
+            classes = child.get("class", [])
+            tag_id = child.get("id", "")
+            is_body = child.name == "div" and "userstuff" in classes
+            is_preface = (
+                "group" in classes or
+                "preface" in classes or
+                tag_id == "preface" or
+                "summary" in tag_id or
+                "summary" in classes
+            )
+            is_endnotes = (
+                "end" in tag_id or
+                "afterword" in tag_id or
+                "endnotes" in tag_id or
+                "afterword" in classes
+            )
+            if not is_body and not is_preface and not is_endnotes and "meta" in classes:
+                if not chapters or current_chapter is None:
+                    is_preface = True
+                else:
+                    is_endnotes = True
+                    
+            if is_body:
+                current_chapter = {
+                    "node": child,
+                    "preface_nodes": list(pending_preface),
+                    "endnotes_nodes": []
+                }
+                chapters.append(current_chapter)
+                pending_preface = []
+            elif is_preface:
+                pending_preface.append(child)
+            elif is_endnotes:
+                if current_chapter:
+                    current_chapter["endnotes_nodes"].append(child)
+                else:
+                    pending_preface.append(child)
+            else:
+                if not chapters:
+                    pending_preface.append(child)
+                    
+        if chapters:
+            results = []
+            for ch in chapters:
+                preface_html = "".join(_format_meta_section(n) for n in ch["preface_nodes"])
+                endnotes_html = "".join(_format_meta_section(n) for n in ch["endnotes_nodes"])
+                results.append({
+                    "node": ch["node"],
+                    "preface_html": preface_html,
+                    "endnotes_html": endnotes_html,
+                })
+            return results
+
     headings = [
         heading
         for heading in soup.find_all(["h2", "h3", "h4"])
         if isinstance(heading, Tag) and re.search(r"\bchapter\b", _text(heading), re.IGNORECASE)
     ]
-    nodes: list[Tag] = []
+    results = []
     for heading in headings:
         parts = [str(heading)]
         for sibling in heading.next_siblings:
@@ -618,8 +745,12 @@ def _reader_chapter_nodes(soup: BeautifulSoup) -> list[Tag]:
             parts.append(str(sibling))
         fragment = BeautifulSoup(f"<div>{''.join(parts)}</div>", "lxml").select_one("div")
         if isinstance(fragment, Tag) and _text(fragment):
-            nodes.append(fragment)
-    return nodes
+            results.append({
+                "node": fragment,
+                "preface_html": "",
+                "endnotes_html": "",
+            })
+    return results
 
 
 def _reader_chapter_title(node: Tag, index: int) -> str:

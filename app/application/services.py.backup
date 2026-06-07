@@ -780,7 +780,6 @@ class FandomService:
         avatar_url: str = "",
         tag_urls: list[str] | None = None,
         notes: str = "",
-        pronoun_type: str = "f",
         reader_style: dict[str, Any] | None = None,
         character_id: str | None = None,
     ) -> ServiceResult:
@@ -797,7 +796,6 @@ class FandomService:
                 avatar_url=avatar_url.strip() or None,
                 tag_urls=[url.strip() for url in (tag_urls or []) if url.strip()],
                 notes=notes.strip() or None,
-                pronoun_type=pronoun_type,
                 reader_style=normalize_character_reader_style(reader_style),
                 created_at=now,
                 updated_at=now,
@@ -3269,7 +3267,6 @@ class LocalModelService:
             "timeout_seconds": self.settings.get("lmstudio_timeout_seconds", 180),
             "temperature": self.settings.get("lmstudio_temperature", 0.2),
             "context_length": self.settings.get("lmstudio_context_length", 0),
-            "auto_unload": bool(self.settings.get("lmstudio_auto_unload", False)),
         }
 
     def save_config(
@@ -3280,14 +3277,12 @@ class LocalModelService:
         timeout_seconds: float,
         temperature: float,
         context_length: int | float | str | None = None,
-        auto_unload: bool = False,
     ) -> ServiceResult:
         self.settings.set("lmstudio_base_url", base_url.strip().rstrip("/") or "http://localhost:1234/v1")
         self.settings.set("lmstudio_model", model.strip())
         self.settings.set("lmstudio_timeout_seconds", max(5, float(timeout_seconds)))
         self.settings.set("lmstudio_temperature", max(0, min(2, float(temperature))))
         self.settings.set("lmstudio_context_length", max(0, int(float(context_length or 0))))
-        self.settings.set("lmstudio_auto_unload", bool(auto_unload))
         return ServiceResult(True, "LM Studio settings saved.")
 
     def available_models(self) -> RemoteResult:
@@ -3350,8 +3345,6 @@ class LocalModelService:
         return ServiceResult(True, f"Unloaded {model}.", payload=unloaded)
 
     def end_queue_model_session(self, session: dict[str, Any] | None) -> ServiceResult:
-        if not self.config().get("auto_unload", False):
-            return ServiceResult(True, "Auto-unload is disabled.")
         if not session or not session.get("owned"):
             return ServiceResult(True, "No AO3 Studio-owned model instance to unload.")
         instance_id = str(session.get("instance_id") or "").strip()
@@ -3727,6 +3720,256 @@ def _clamp_chapter(chapter_index: int, chapters: list[ReaderChapter]) -> int:
 #  Dialogue Attribution Mode (DAM) — Tinted Dialogue
 # ---------------------------------------------------------------------------
 
-from app.application.dam_service import DamService
+_DAM_QUOTE_CHARS = set('""\u201c\u201d\u00ab\u00bb\u2018\u2019')
+_DAM_SYSTEM_PROMPT = (
+    "Attribute dialogue to characters from the list. You MUST process ALL paragraphs provided. "
+    "Output JSON format: {\"d\": [{\"paragraph_index\": <int>, \"character_id\": \"<character_id>\", \"quote_text\": \"<exact_dialogue>\"}]}. "
+    "CRITICAL RULES: "
+    "1. `paragraph_index` must match the number preceding the paragraph. "
+    "2. `quote_text` must be ONLY the exact words inside the quotation marks. No narration. "
+    "3. If a paragraph has multiple separate quotes, output a SEPARATE JSON object for each quote. DO NOT merge them! "
+    "4. Do not stop until you have extracted and attributed EVERY quote from EVERY paragraph. "
+    "5. If a POV character is given, untagged quotes likely belong to them."
+)
+
+
+def _dam_response_format() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "dam_response",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "d": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "paragraph_index": {"type": "integer"},
+                                "character_id": {"type": "string"},
+                                "quote_text": {"type": "string"},
+                            },
+                            "required": ["paragraph_index", "character_id", "quote_text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["d"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _dam_extract_paragraphs(chapter_html: str) -> list[dict[str, Any]]:
+    """Extract block elements from chapter HTML, returning pid + text for each."""
+    soup = BeautifulSoup(chapter_html or "", "lxml")
+    body = soup.body or soup
+    blocks: list[dict[str, Any]] = []
+    for node in body.find_all(["p", "blockquote", "div"]):
+        if node.name == "div" and node.find(["p", "blockquote", "div"]):
+            continue
+        text = node.get_text(" ", strip=True)
+        if text:
+            blocks.append({"pid": len(blocks), "text": text})
+    return blocks
+
+
+def _dam_has_dialogue(text: str) -> bool:
+    return bool(_DAM_QUOTE_CHARS.intersection(text))
+
+
+def _dam_character_alias_map(characters: list[CharacterProfile]) -> dict[str, list[str]]:
+    """Build {character_id: [name, alias1, ...]} from character profiles."""
+    result: dict[str, list[str]] = {}
+    for character in characters:
+        aliases: list[str] = []
+        for source in (character.name, character.full_name):
+            clean = " ".join(str(source or "").split())
+            if clean and clean not in aliases:
+                aliases.append(clean)
+            first = re.split(r"\s+", clean, maxsplit=1)[0].strip()
+            if first and len(first) >= 3 and first not in aliases:
+                aliases.append(first)
+        for tag_url in character.tag_urls or []:
+            parts = str(tag_url or "").strip("/").rsplit("/", 1)
+            if len(parts) >= 2:
+                label = parts[-1].replace("*s*", "'").replace("%20", " ").replace("*a*", "&").replace("_", " ").strip()
+                if label and label not in aliases:
+                    aliases.append(label)
+        if aliases:
+            result[character.id] = aliases
+    return result
+
+
+class DamService:
+    """Dialogue attribution via LM Studio for Tinted Dialogue Mode."""
+
+    def __init__(
+        self,
+        dam_repo: Any,
+        lmstudio_provider: Any,
+        character_repo: Any,
+        reader_asset_repo: Any,
+    ) -> None:
+        self.dam_repo = dam_repo
+        self.lmstudio = lmstudio_provider
+        self.characters = character_repo
+        self.reader_assets = reader_asset_repo
+
+    def get_attributions(self, work_id: str, chapter_idx: int) -> list[dict]:
+        return self.dam_repo.get_attributions(work_id, chapter_idx)
+
+    def get_dam_status(self, work_id: str, chapter_idx: int) -> str:
+        return self.dam_repo.get_dam_status(work_id, chapter_idx)
+
+    def clear_attributions(self, work_id: str, chapter_idx: int) -> ServiceResult:
+        import shutil
+
+        from app.infrastructure.config.paths import AUDIO_CACHE_DIR
+
+        try:
+            self.dam_repo.clear_attributions(work_id, chapter_idx)
+            audio_dir = AUDIO_CACHE_DIR / str(work_id) / f"ch{chapter_idx}"
+            if audio_dir.exists():
+                shutil.rmtree(audio_dir, ignore_errors=True)
+            return ServiceResult(True, "Attributions cleared.")
+        except Exception as exc:  # noqa: BLE001
+            return ServiceResult(False, f"Failed to clear attributions: {exc}")
+
+    def mark_stale(self, work_id: str) -> None:
+        self.dam_repo.mark_stale_for_work(work_id)
+
+    def run_attribution(
+        self,
+        work_id: str,
+        chapter_idx: int,
+        chapter_html: str,
+        fandom_key: str,
+        pov_character_id: str | None = None,
+    ) -> ServiceResult:
+        import httpx
+
+        try:
+            self.dam_repo.set_dam_status(work_id, chapter_idx, "pending")
+            all_paragraphs = _dam_extract_paragraphs(chapter_html)
+            if not all_paragraphs:
+                self.dam_repo.set_dam_status(work_id, chapter_idx, "none")
+                return ServiceResult(False, "No paragraphs found in chapter.")
+
+            dialogue_paragraphs = [p for p in all_paragraphs if _dam_has_dialogue(p["text"])]
+            if not dialogue_paragraphs:
+                self.dam_repo.set_dam_status(work_id, chapter_idx, "none")
+                return ServiceResult(False, "No dialogue found in chapter.")
+
+            characters = self.characters.list_for_fandom(fandom_key)
+            alias_map = _dam_character_alias_map(characters)
+            if not alias_map:
+                self.dam_repo.set_dam_status(work_id, chapter_idx, "none")
+                return ServiceResult(False, "No characters found for fandom.")
+
+            # Create short IDs for the LLM payload to save tokens
+            short_to_uuid = {}
+            uuid_to_short = {}
+            for i, cid in enumerate(alias_map.keys(), 1):
+                short_id = f"c{i}"
+                short_to_uuid[short_id] = cid
+                uuid_to_short[cid] = short_id
+
+            char_lines = "\n".join(
+                f"{uuid_to_short[cid]}: {', '.join(aliases)}" for cid, aliases in alias_map.items()
+            )
+            para_lines = "\n".join(
+                f"{p['pid']}|{p['text']}" for p in dialogue_paragraphs
+            )
+            pov_line = ""
+            if pov_character_id and pov_character_id in alias_map:
+                pov_name = alias_map[pov_character_id][0]
+                short_pov = uuid_to_short[pov_character_id]
+                pov_line = f"POV: {pov_name} ({short_pov})\n"
+            user_content = (
+                f"Characters:\n{char_lines}\n\n"
+                f"{pov_line}"
+                f"Paragraphs:\n{para_lines}"
+            )
+
+            model = self.lmstudio.model
+            if not model:
+                self.dam_repo.set_dam_status(work_id, chapter_idx, "none")
+                return ServiceResult(False, "Choose an LM Studio model in Settings first.")
+
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _DAM_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                "response_format": _dam_response_format(),
+                "temperature": 0.1,
+                "stream": False,
+            }
+
+            with httpx.Client(timeout=self.lmstudio.timeout) as client:
+                response = client.post(
+                    f"{self.lmstudio.base_url}/chat/completions",
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            content = data["choices"][0]["message"]["content"]
+            result = json.loads(content)
+
+            # Debug log to workspace root
+            import os
+            import json as json_mod
+            with open(r"E:\z_Lena_Dev_Apps\AO3_Studio\dam_debug_log.json", "w", encoding="utf-8") as f:
+                json_mod.dump({"payload": payload, "raw_response": content, "parsed": result}, f, indent=2)
+
+            flat: list[dict] = []
+            dam_seq = 0
+            for entry in result.get("d", []):
+                pid = int(entry.get("paragraph_index", -1))
+                short_sid = str(entry.get("character_id", "")).strip()
+                q_text = str(entry.get("quote_text", "")).strip()
+                
+                # Resolve short ID back to UUID
+                sid = short_to_uuid.get(short_sid, "")
+                
+                if pid < 0 or not sid or len(q_text) < 2:
+                    continue
+                
+                # Cleanup: if LLM hallucinated quotes around the text, strip them
+                q_text = q_text.strip('""\u201c\u201d\u00ab\u00bb\u2018\u2019 ')
+                if not q_text:
+                    continue
+
+                flat.append({
+                    "pid": pid,
+                    "dam_seq": dam_seq,
+                    "quote_text": q_text,
+                    "speaker_id": sid,
+                    "confidence": "high",
+                })
+                dam_seq += 1
+
+            self.dam_repo.upsert_attributions(work_id, chapter_idx, flat, model)
+            count = len(flat)
+            return ServiceResult(
+                True,
+                f"Attributed {count} dialogue{'s' if count != 1 else ''}.",
+                payload={"count": count},
+            )
+        except httpx.HTTPStatusError as exc:
+            self.dam_repo.set_dam_status(work_id, chapter_idx, "none")
+            return ServiceResult(False, f"LM Studio HTTP error: {exc.response.status_code}")
+        except httpx.ConnectError:
+            self.dam_repo.set_dam_status(work_id, chapter_idx, "none")
+            return ServiceResult(False, "Cannot connect to LM Studio. Is it running?")
+        except Exception as exc:  # noqa: BLE001
+            self.dam_repo.set_dam_status(work_id, chapter_idx, "none")
+            return ServiceResult(False, f"Attribution failed: {exc}")
 
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-06-06
+
+### Added
+- Added fandom-wide custom styling context menu for character names and dialogue (Disable Name Color, Disable Name Glow, Give dialogue name look, Give POV dialogue name look) on the Tinted Dialogue icon.
+- Added right-click character pill expansion directly in the Read tab's side panel.
+- Added click-to-collapse anywhere in the right panel to close expanded character cards.
+- Added per-character custom dialogue tint color configurations (dialog + color picker + toggle) next to the reader font style icon.
+
+### Changed
+- Integrated custom dialogue tint settings into paragraph color styling, using the custom color when enabled and falling back to the character's own profile color when disabled.
+
+### Fixed
+- Fixed timer `RuntimeError: The parent slot of the element has been deleted` during reader center container clear by deactivating pending scroll timers.
+- Fixed right-panel render crash (`NameError: name 'character_tag_suggestion_js' is not defined`) by defining the tag suggestion helper locally inside `_render_character_expanded_panel`.
+
+### Tests
+- Added test coverage for disabling name color/glow, dialogue name look styling, and custom dialogue tinting overrides.
+
 ## 2026-06-05
 
 ### Added

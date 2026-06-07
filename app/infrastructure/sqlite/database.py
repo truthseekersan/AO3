@@ -86,6 +86,22 @@ class SQLiteDatabase:
             if version < 15:
                 self._migrate_v15(conn)
                 conn.execute("PRAGMA user_version = 15")
+                version = 15
+            if version < 16:
+                self._migrate_v16(conn)
+                conn.execute("PRAGMA user_version = 16")
+                version = 16
+            if version < 17:
+                self._migrate_v17(conn)
+                conn.execute("PRAGMA user_version = 17")
+                version = 17
+            if version < 18:
+                self._migrate_v18(conn)
+                conn.execute("PRAGMA user_version = 18")
+                version = 18
+            if version < 19:
+                self._migrate_v19(conn)
+                conn.execute("PRAGMA user_version = 19")
             conn.commit()
         finally:
             conn.close()
@@ -734,6 +750,67 @@ class SQLiteDatabase:
                 ON fandom_directory_cache(tag, label);
             CREATE INDEX IF NOT EXISTS idx_fandom_directory_cache_media
                 ON fandom_directory_cache(media_key, tag);
+            """
+        )
+
+    @staticmethod
+    def _migrate_v16(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS dam_attributions (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id      TEXT NOT NULL,
+                chapter_idx  INTEGER NOT NULL,
+                pid          INTEGER NOT NULL,
+                dam_seq      INTEGER NOT NULL,
+                quote_text   TEXT NOT NULL,
+                speaker_id   TEXT,
+                confidence   TEXT,
+                model_id     TEXT,
+                generated_at TEXT,
+                UNIQUE(work_id, chapter_idx, pid, dam_seq)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dam_attributions_chapter
+                ON dam_attributions(work_id, chapter_idx, pid, dam_seq);
+            """
+        )
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(reader_chapters)").fetchall()
+        }
+        if "dam_status" not in columns:
+            conn.execute("ALTER TABLE reader_chapters ADD COLUMN dam_status TEXT DEFAULT 'none'")
+        if "dam_audio_status" not in columns:
+            conn.execute("ALTER TABLE reader_chapters ADD COLUMN dam_audio_status TEXT DEFAULT 'none'")
+
+    @staticmethod
+    def _migrate_v17(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(dam_attributions)").fetchall()
+        }
+        if "is_italics" not in columns:
+            conn.execute("ALTER TABLE dam_attributions ADD COLUMN is_italics INTEGER NOT NULL DEFAULT 0")
+
+    @staticmethod
+    def _migrate_v18(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(character_profiles)").fetchall()
+        }
+        if "pronoun_type" not in columns:
+            conn.execute("ALTER TABLE character_profiles ADD COLUMN pronoun_type TEXT NOT NULL DEFAULT 'F'")
+
+    @staticmethod
+    def _migrate_v19(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS delete_dam_attributions_on_work_delete
+            AFTER DELETE ON works
+            BEGIN
+                DELETE FROM dam_attributions WHERE work_id = OLD.work_id;
+            END;
             """
         )
 

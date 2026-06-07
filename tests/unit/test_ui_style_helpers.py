@@ -20,6 +20,7 @@ from app.presentation.ui.app_shell import (
     _reader_highlight_characters,
     _reader_visible_characters_for_chapter,
     _reader_apply_pov_paragraph_colors,
+    _reader_apply_dam_paragraph_colors,
     _scriptstudio_lighten_color,
 )
 from app.presentation.ui.theme import apply_theme
@@ -452,8 +453,8 @@ def test_reader_side_panel_character_pills_and_left_expanding_avatar_tooltip_exi
     assert 'expand_side="left"' in pill_source
     assert "_reader_apply_pov_paragraph_colors" in page_read_source
     assert "selected_character.color if selected_character else None" in page_read_source
-    assert "_reader_highlight_characters(chapter.html, characters)" in page_read_source
-    assert page_read_source.index("_reader_highlight_characters") < page_read_source.index("_reader_apply_pov_paragraph_colors")
+    assert "_reader_highlight_characters(rendered, characters)" in page_read_source
+    assert page_read_source.index("_reader_highlight_characters") > page_read_source.index("_reader_apply_pov_paragraph_colors")
     assert 'tooltip_anchor = "center left" if expand_side == "left" else "center right"' in avatar_source
     assert 'tooltip_self = "center right" if expand_side == "left" else "center left"' in avatar_source
     assert ".reader-character-pill" in theme_source
@@ -726,7 +727,7 @@ def test_character_font_wheel_updates_character_size_not_global_style(tmp_path) 
     shell = AO3StudioShell(container)
     shell.page = "Read"
     shell.selected_work_id = work.work_id
-    container.preferences_service.set("reader_work_id", work.work_id)
+    container.preferences_service.set(shell._reader_work_id_key(profile.fandom_key), work.work_id)
     container.preferences_service.set(shell._reader_selected_character_key(work.work_id, 1), "max")
 
     shell._handle_reader_font_wheel(SimpleNamespace(args={"step": 1}))
@@ -1317,3 +1318,385 @@ def test_unrated_work_gets_no_rarity_border_until_common_is_assigned(tmp_path) -
     classes, inline_style = shell._rarity_border_for_work(work.work_id, style)
     assert classes == ""
     assert "rgba(100,116,139,0.68)" in inline_style
+
+
+def test_right_footer_and_trash_arming(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    shell = AO3StudioShell(container)
+    assert hasattr(shell, "right_footer_container")
+    assert hasattr(shell, "dam_trash_armed_chapter")
+    assert shell.dam_trash_armed_chapter is None
+
+    # Verify that the disarm handler can be called without error
+    shell.dam_trash_armed_chapter = ("12345", 1)
+    # Mock _render_right_footer to assert it gets called
+    called = False
+    def mock_render_footer():
+        nonlocal called
+        called = True
+    shell._render_right_footer = mock_render_footer
+    shell._disarm_dam_trash()
+    assert shell.dam_trash_armed_chapter is None
+    assert called is True
+
+
+def test_dam_metadata_persistence_and_work_delete_trigger(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    shell = AO3StudioShell(container)
+    assert hasattr(shell, "_run_dam_work_analysis")
+
+    # 1. Insert a work and chapter with complete dam_status
+    work = Work(
+        "work_trigger_test",
+        "https://archiveofourown.org/works/work_trigger_test",
+        title="Trigger Test",
+        last_scraped_at="2026-01-01T00:00:00Z",
+    )
+    container.work_repo.upsert(work)
+
+    ch = ReaderChapter("work_trigger_test", 1, "Chapter 1", "https://url", "ch1", "<p>Test</p>", "h1")
+    asset = ReaderAsset("work_trigger_test", "html", "src", "dl", "hash", 1, 1, "2026-01-01T00:00:00Z")
+    container.reader_asset_repo.replace_document(asset, [ch])
+
+    container.dam_repo.set_dam_status("work_trigger_test", 1, "complete")
+    attribs = [{"pid": 0, "dam_seq": 0, "quote_text": "Hello", "speaker_id": "c1", "confidence": "high", "is_italics": 0}]
+    container.dam_repo.upsert_attributions("work_trigger_test", 1, attribs, "model_x")
+
+    assert container.dam_repo.get_dam_status("work_trigger_test", 1) == "complete"
+    assert len(container.dam_repo.get_attributions("work_trigger_test", 1)) == 1
+
+    # 2. Test replace_document preserves dam_status
+    new_ch = ReaderChapter("work_trigger_test", 1, "Chapter 1 New", "https://url", "ch1", "<p>New Test</p>", "h2")
+    container.reader_asset_repo.replace_document(asset, [new_ch])
+
+    assert container.dam_repo.get_dam_status("work_trigger_test", 1) == "complete"
+    assert len(container.dam_repo.get_attributions("work_trigger_test", 1)) == 1
+
+    # 3. Test that deleting work deletes the attributions via trigger
+    with container.db.connect() as conn:
+        conn.execute("DELETE FROM works WHERE work_id = ?", ("work_trigger_test",))
+        conn.commit()
+
+    assert len(container.dam_repo.get_attributions("work_trigger_test", 1)) == 0
+
+
+def test_reverse_tinted_narration_coloring() -> None:
+    characters = [SimpleNamespace(id="char_pov", color="#ff0000")]
+    attributions = [
+        {"pid": 0, "dam_seq": 0, "quote_text": "Hello POV", "speaker_id": "char_pov", "confidence": "high", "is_italics": 0}
+    ]
+    html_fragment = "<p>Hello POV</p>"
+
+    # 1. Without reverse tinted narration
+    rendered_normal = _reader_apply_dam_paragraph_colors(
+        html_fragment,
+        attributions,
+        characters,
+        pov_color="#ff0000",
+        narration_tint=True,
+        italics_enabled=True,
+        pov_character_id="char_pov",
+        reverse_narration_tint=False,
+    )
+    assert "color:" in rendered_normal
+
+    # 2. With reverse tinted narration (neutral color #c9d1d9)
+    rendered_reverse = _reader_apply_dam_paragraph_colors(
+        html_fragment,
+        attributions,
+        characters,
+        pov_color="#ff0000",
+        narration_tint=True,
+        italics_enabled=True,
+        pov_character_id="char_pov",
+        reverse_narration_tint=True,
+    )
+    assert "color: #c9d1d9" in rendered_reverse
+
+
+def test_default_narration_tint_is_disabled_by_default(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    shell = AO3StudioShell(container)
+
+    # For a new work, narration tint must be disabled by default (neutral narration)
+    assert shell._reader_dam_narration_tint_enabled("new_work_123") is False
+
+
+def test_auto_unload_settings_persistence(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    config = container.local_model_service.config()
+    assert config.get("auto_unload") is False
+
+    container.local_model_service.save_config(
+        base_url="http://localhost:1234/v1",
+        model="some-model",
+        timeout_seconds=200,
+        temperature=0.5,
+        context_length=4096,
+        auto_unload=True,
+    )
+
+    config2 = container.local_model_service.config()
+    assert config2.get("auto_unload") is True
+
+
+def test_works_tab_filters_by_active_fandom_by_default(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+
+    fandom1 = FandomProfile(fandom_key="lis", tag="Life is Strange", display_name="LIS")
+    fandom2 = FandomProfile(fandom_key="btvs", tag="Buffy the Vampire Slayer", display_name="Buffy")
+    container.fandom_repo.save(fandom1)
+    container.fandom_repo.save(fandom2)
+
+    w1 = Work("work-lis", "https://url1", title="LIS Work", last_scraped_at="2026-01-01T00:00:00Z")
+    w2 = Work("work-buffy", "https://url2", title="Buffy Work", last_scraped_at="2026-01-01T00:00:00Z")
+    container.work_repo.upsert(w1)
+    container.work_repo.upsert(w2)
+
+    container.tag_repo.replace_for_work("work-lis", [WorkTag("work-lis", TagType.FANDOM, "Life is Strange")])
+    container.tag_repo.replace_for_work("work-buffy", [WorkTag("work-buffy", TagType.FANDOM, "Buffy the Vampire Slayer")])
+
+    container.work_library_service.collect("work-lis", "lis")
+    container.work_library_service.collect("work-buffy", "btvs")
+
+    shell = AO3StudioShell(container)
+    container.preferences_service.set("active_fandom_key", "lis")
+
+    model_filtered = shell._works_page_model_for_current_state()
+    assert [w.work_id for w in model_filtered.works] == ["work-lis"]
+
+    shell._toggle_show_all_works(True)
+    model_all = shell._works_page_model_for_current_state()
+    assert set(w.work_id for w in model_all.works) == {"work-lis", "work-buffy"}
+
+
+def test_fandom_scoped_reader_work_id(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    
+    fandom_lis = FandomProfile(fandom_key="lis", tag="Life is Strange", display_name="LIS")
+    fandom_re = FandomProfile(fandom_key="re", tag="Resident Evil", display_name="RE")
+    container.fandom_repo.save(fandom_lis)
+    container.fandom_repo.save(fandom_re)
+
+    w_lis = Work("work-lis", "https://url-lis", title="LIS Fic")
+    w_re = Work("work-re", "https://url-re", title="RE Fic")
+    container.work_repo.upsert(w_lis)
+    container.work_repo.upsert(w_re)
+
+    container.tag_repo.replace_for_work("work-lis", [WorkTag("work-lis", TagType.FANDOM, "Life is Strange")])
+    container.tag_repo.replace_for_work("work-re", [WorkTag("work-re", TagType.FANDOM, "Resident Evil")])
+
+    container.work_library_service.collect("work-lis", "lis")
+    container.work_library_service.collect("work-re", "re")
+
+    shell = AO3StudioShell(container)
+
+    container.fandom_service.select("lis")
+    shell._open_reader("work-lis")
+
+    container.fandom_service.select("re")
+    shell._open_reader("work-re")
+
+    container.fandom_service.select("lis")
+    assert shell._get_reader_work_id() == "work-lis"
+
+    container.fandom_service.select("re")
+    assert shell._get_reader_work_id() == "work-re"
+
+    shell.selected_work_id = "work-lis"
+    assert shell._get_reader_work_id() == "work-re"
+
+
+def test_open_reader_switches_fandom_automatically(tmp_path) -> None:
+    container = build_container(tmp_path / "ao3.sqlite")
+    
+    fandom_lis = FandomProfile(fandom_key="lis", tag="Life is Strange", display_name="LIS")
+    fandom_re = FandomProfile(fandom_key="re", tag="Resident Evil", display_name="RE")
+    container.fandom_repo.save(fandom_lis)
+    container.fandom_repo.save(fandom_re)
+
+    w_lis = Work("work-lis", "https://url-lis", title="LIS Fic")
+    w_re = Work("work-re", "https://url-re", title="RE Fic")
+    container.work_repo.upsert(w_lis)
+    container.work_repo.upsert(w_re)
+
+    container.tag_repo.replace_for_work("work-lis", [WorkTag("work-lis", TagType.FANDOM, "Life is Strange")])
+    container.tag_repo.replace_for_work("work-re", [WorkTag("work-re", TagType.FANDOM, "Resident Evil")])
+
+    container.work_library_service.collect("work-lis", "lis")
+    container.work_library_service.collect("work-re", "re")
+
+    shell = AO3StudioShell(container)
+
+    container.fandom_service.select("lis")
+    assert shell._active_fandom().fandom_key == "lis"
+
+    shell._open_reader("work-re")
+
+    assert shell._active_fandom().fandom_key == "re"
+    assert shell.page == "Read"
+    assert shell._get_reader_work_id() == "work-re"
+
+
+def test_reader_highlight_characters_disable_color_and_glow() -> None:
+    maxine = SimpleNamespace(
+        id="max",
+        fandom_key="lis",
+        name="Max",
+        full_name="Maxine Caulfield",
+        tag_urls=["https://archiveofourown.org/tags/Maxine%20Caulfield/works"],
+        color="#58a6ff",
+    )
+    fragment = "<p>Hello Max</p>"
+
+    # Test 1: disable color only -> both color and glow are disabled (no name look)
+    highlighted_no_color = _reader_highlight_characters(fragment, [maxine], disable_name_color=True, disable_name_glow=False)
+    assert "color:" not in highlighted_no_color
+    assert "text-shadow:" not in highlighted_no_color
+
+    # Test 2: disable glow only
+    highlighted_no_glow = _reader_highlight_characters(fragment, [maxine], disable_name_color=False, disable_name_glow=True)
+    assert "color:" in highlighted_no_glow
+    assert "text-shadow:" not in highlighted_no_glow
+
+    # Test 3: disable both
+    highlighted_both = _reader_highlight_characters(fragment, [maxine], disable_name_color=True, disable_name_glow=True)
+    assert "color:" not in highlighted_both
+    assert "text-shadow:" not in highlighted_both
+
+
+def test_reader_apply_dam_dialogue_style_options() -> None:
+    characters = [
+        SimpleNamespace(id="char_pov", color="#ff0000"),
+        SimpleNamespace(id="char_other", color="#00ff00"),
+    ]
+    attributions = [
+        {"pid": 0, "dam_seq": 0, "quote_text": "Hello POV", "speaker_id": "char_pov", "confidence": "high", "is_italics": 0},
+        {"pid": 1, "dam_seq": 0, "quote_text": "Hello Other", "speaker_id": "char_other", "confidence": "high", "is_italics": 0},
+    ]
+    html_fragment = "<p>Hello POV</p><p>Hello Other</p>"
+
+    # 1. dialogue_style="all" -> both quotes get speaker's color and glow
+    rendered_all = _reader_apply_dam_paragraph_colors(
+        html_fragment,
+        attributions,
+        characters,
+        pov_color="#ff0000",
+        narration_tint=False,
+        italics_enabled=True,
+        pov_character_id="char_pov",
+        reverse_narration_tint=False,
+        dialogue_style="all",
+    )
+    # Check that both quotes have glow effects
+    assert "text-shadow:" in rendered_all
+    assert rendered_all.count("text-shadow:") == 2
+
+    # 2. dialogue_style="pov" -> only POV quote gets color and glow
+    rendered_pov = _reader_apply_dam_paragraph_colors(
+        html_fragment,
+        attributions,
+        characters,
+        pov_color="#ff0000",
+        narration_tint=False,
+        italics_enabled=True,
+        pov_character_id="char_pov",
+        reverse_narration_tint=False,
+        dialogue_style="pov",
+    )
+    assert "text-shadow:" in rendered_pov
+    assert rendered_pov.count("text-shadow:") == 1  # only pov quote has text-shadow
+
+    # 3. dialogue_style="none" -> no name-style applied, just dialogue color
+    rendered_none = _reader_apply_dam_paragraph_colors(
+        html_fragment,
+        attributions,
+        characters,
+        pov_color="#ff0000",
+        narration_tint=False,
+        italics_enabled=True,
+        pov_character_id="char_pov",
+        reverse_narration_tint=False,
+        dialogue_style="none",
+    )
+    assert "text-shadow:" not in rendered_none
+
+    # 4. dialogue_style="all" always applies full name look (color + glow)
+    #    even though _reader_highlight_characters has separate name-disable flags
+    rendered_full = _reader_apply_dam_paragraph_colors(
+        html_fragment,
+        attributions,
+        characters,
+        pov_color="#ff0000",
+        narration_tint=False,
+        italics_enabled=True,
+        pov_character_id="char_pov",
+        reverse_narration_tint=False,
+        dialogue_style="all",
+    )
+    assert "text-shadow:" in rendered_full
+    assert rendered_full.count("text-shadow:") == 2
+    assert "color:" in rendered_full
+
+
+def test_reader_apply_dam_custom_dialogue_tints() -> None:
+    characters = [
+        SimpleNamespace(id="char_pov", color="#ff0000"),
+        SimpleNamespace(id="char_other", color="#00ff00"),
+    ]
+    attributions = [
+        {"pid": 0, "dam_seq": 0, "quote_text": "Hello POV", "speaker_id": "char_pov", "confidence": "high", "is_italics": 0},
+        {"pid": 1, "dam_seq": 0, "quote_text": "Hello Other", "speaker_id": "char_other", "confidence": "high", "is_italics": 0},
+    ]
+    html_fragment = "<p>Hello POV</p><p>Hello Other</p>"
+
+    # 1. Custom tints enabled for char_other with custom color #0000ff (blue)
+    #    POV is char_pov (#ff0000)
+    custom_tints_enabled = {"char_other": True, "char_pov": False}
+    custom_tint_colors = {"char_other": "#0000ff"}
+
+    rendered_custom = _reader_apply_dam_paragraph_colors(
+        html_fragment,
+        attributions,
+        characters,
+        pov_color="#ff0000",
+        narration_tint=False,
+        italics_enabled=True,
+        pov_character_id="char_pov",
+        reverse_narration_tint=False,
+        dialogue_style="none",
+        custom_tints_enabled=custom_tints_enabled,
+        custom_tint_colors=custom_tint_colors,
+    )
+
+    expected_pov_lightened = _scriptstudio_lighten_color("#ff0000", 0.25)
+    expected_other_lightened = _scriptstudio_lighten_color("#0000ff", 0.25)
+    expected_fallback_lightened = _scriptstudio_lighten_color("#00ff00", 0.25)
+
+    assert expected_pov_lightened in rendered_custom
+    assert expected_other_lightened in rendered_custom
+    assert expected_fallback_lightened not in rendered_custom
+
+    # 2. Both disabled -> both default to their own character colors
+    rendered_default = _reader_apply_dam_paragraph_colors(
+        html_fragment,
+        attributions,
+        characters,
+        pov_color="#ff0000",
+        narration_tint=False,
+        italics_enabled=True,
+        pov_character_id="char_pov",
+        reverse_narration_tint=False,
+        dialogue_style="none",
+        custom_tints_enabled={"char_other": False, "char_pov": False},
+        custom_tint_colors={},
+    )
+    assert expected_pov_lightened in rendered_default
+    assert expected_fallback_lightened in rendered_default
+
+
+
+
+
+
+

@@ -17,6 +17,7 @@ build/
 
 # AO3 Studio private local state
 /config/
+/config/audio_cache/
 /logs/
 *.sqlite
 *.sqlite3

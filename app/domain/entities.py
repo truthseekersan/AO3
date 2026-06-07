@@ -99,6 +99,7 @@ class CharacterProfile:
     avatar_url: str | None = None
     tag_urls: list[str] = field(default_factory=list)
     notes: str | None = None
+    pronoun_type: str = "F"
     reader_style: JsonDict = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""

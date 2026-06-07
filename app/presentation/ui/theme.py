@@ -461,15 +461,24 @@ def apply_theme() -> None:
                 top: 8px;
                 right: 8px;
                 z-index: 30;
-                background: rgba(13, 17, 23, 0.48);
-                border: 1px solid rgba(48, 54, 61, 0.52);
-                border-radius: 999px;
-                backdrop-filter: blur(8px);
                 pointer-events: auto;
             }
             .work-card-actions .q-btn,
             .work-action-button {
                 pointer-events: auto;
+                transition: transform 0.18s cubic-bezier(0.4, 0, 0.2, 1), color 0.18s ease !important;
+            }
+            .work-card-actions .q-btn:hover,
+            .work-action-button:hover {
+                transform: scale(1.18);
+            }
+            .work-card-actions .q-btn:active,
+            .work-action-button:active {
+                transform: scale(0.92);
+            }
+            .work-card-actions .q-btn .q-focus-helper,
+            .work-action-button .q-focus-helper {
+                display: none !important;
             }
             .work-card-body {
                 position: relative;
@@ -751,6 +760,25 @@ def apply_theme() -> None:
             }
             .reader-prose a {
                 color: #93c5fd;
+            }
+            /* Tinted Dialogue Mode — cosmetic only, zero layout impact */
+            .reader-prose.dam-active .dam {
+                color: var(--dam-c);
+            }
+            .reader-prose:not(.dam-active) .dam {
+                color: inherit;
+            }
+            /* Audio scaffold: clickable cursor when DAudio is active */
+            .dam-audio-active .dam[data-work-id] {
+                cursor: pointer;
+            }
+            .reader-dam-separator {
+                width: 1px;
+                height: 18px;
+                margin: 0 3px;
+                background: #30363d;
+                display: inline-block;
+                vertical-align: middle;
             }
             .work-tag-pill {
                 max-width: 100%;

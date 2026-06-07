@@ -1507,6 +1507,7 @@ def test_queue_runner_continues_after_work_failure_and_unloads_owned_model(tmp_p
         timeout_seconds=30,
         temperature=0.2,
         context_length=4096,
+        auto_unload=True,
     )
     container.queue_runner_service.save_config(
         {
