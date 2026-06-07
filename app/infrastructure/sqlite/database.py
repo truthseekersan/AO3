@@ -102,6 +102,10 @@ class SQLiteDatabase:
             if version < 19:
                 self._migrate_v19(conn)
                 conn.execute("PRAGMA user_version = 19")
+                version = 19
+            if version < 20:
+                self._migrate_v20(conn)
+                conn.execute("PRAGMA user_version = 20")
             conn.commit()
         finally:
             conn.close()
@@ -811,6 +815,16 @@ class SQLiteDatabase:
             BEGIN
                 DELETE FROM dam_attributions WHERE work_id = OLD.work_id;
             END;
+            """
+        )
+
+    @staticmethod
+    def _migrate_v20(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            DELETE FROM work_sets 
+            WHERE lower(name) = 'life is strange p1 revised at'
+              AND id NOT IN (SELECT DISTINCT work_set_id FROM evaluation_batches)
             """
         )
 

@@ -474,9 +474,13 @@ class DamService:
                     })
                     dam_seq += 1
 
-            # Debug logs to workspace root
+            # Debug logs to logs directory
+            from app.infrastructure.config.paths import ROOT_DIR
+            log_dir = ROOT_DIR / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
             for pass_name, log_data in debug_logs.items():
-                with open(fr"E:\z_Lena_Dev_Apps\AO3_Studio\dam_debug_log_{pass_name}.json", "w", encoding="utf-8") as f:
+                log_file_path = log_dir / f"dam_debug_log_{pass_name}.json"
+                with open(log_file_path, "w", encoding="utf-8") as f:
                     json_mod.dump(log_data, f, indent=2)
 
             if not flat:

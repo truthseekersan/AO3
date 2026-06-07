@@ -387,6 +387,15 @@ def test_grouped_cluster_schema_slots_queue_and_cleanup_schema(tmp_path) -> None
     assert empty_slot.state == "empty"
     assert container.queue_service.create_queue_for_schema_slot(work_set.id, alt_schema.schema_key).ok
 
+    # Clean the active schema slot first (leaving only the alt schema batch)
+    assert container.queue_service.clean_queue_schema_slot(work_set.id, active_schema.schema_key).ok
+
+    # Now clean the last remaining slot using clean_evaluated_schema_slot
+    assert container.queue_service.clean_evaluated_schema_slot(work_set.id, alt_schema.schema_key).ok
+
+    # Verify that the work_set is deleted
+    assert container.work_set_repo.get(work_set.id) is None
+
 
 def test_queue_cleanup_archives_partial_batch_and_preserves_evaluated_results(tmp_path) -> None:
     container = build_container(tmp_path / "ao3.sqlite")
@@ -1569,6 +1578,26 @@ def test_queue_runner_continues_after_work_failure_and_unloads_owned_model(tmp_p
     assert container.evaluation_service.latest_for_work("runner-a").chapter_scope["sampled_words"] == 4
     assert container.evaluation_service.latest_for_work("runner-b") is None
     assert container.evaluation_service.latest_for_work("runner-c").scores["craft"] == 7
+
+    from app.infrastructure.config.paths import ROOT_DIR
+    log_file = ROOT_DIR / "logs" / "latest_queue_run.json"
+    assert log_file.exists()
+    with open(log_file, "r", encoding="utf-8") as f:
+        log_json = json.load(f)
+    assert log_json["batch_id"] == batch.id
+    assert log_json["schema_key"] == "local_default_v1"
+    assert "start_time" in log_json
+    assert "end_time" in log_json
+    assert log_json["stats"]["completed"] == 2
+    assert log_json["stats"]["failed"] == 1
+    evals = {e["work_id"]: e for e in log_json["evaluations"]}
+    assert len(evals) == 3
+    assert evals["runner-a"]["status"] == "success"
+    assert evals["runner-a"]["parsed_response"]["scores"]["craft"] == 7
+    assert evals["runner-b"]["status"] == "failed"
+    assert len(evals["runner-b"]["errors"]) > 0
+    assert evals["runner-c"]["status"] == "success"
+    log_file.unlink()
 
 
 def test_active_schema_selection_is_persisted(tmp_path) -> None:

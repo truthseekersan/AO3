@@ -1150,16 +1150,30 @@ class EvaluationService:
                 prompt_template=schema.prompt_template,
             )
         except Exception as exc:  # noqa: BLE001 - surface local model errors to the UI
+            debug_payload = getattr(exc, "debug_payload", None)
+            debug_raw_response = getattr(exc, "debug_raw_response", None)
             return EvaluationResult(
                 False,
                 f"LM Studio evaluation failed: {exc}",
                 errors=[str(exc)],
-                payload={"fatal": self._model_exception_is_fatal(exc)},
+                payload={
+                    "fatal": self._model_exception_is_fatal(exc),
+                    "debug_payload": debug_payload,
+                    "debug_raw_response": debug_raw_response,
+                },
             )
         scores = result.get("scores", {})
         validation = SchemaPolicy.validate_scores(schema, scores)
         if not validation.valid:
-            return EvaluationResult(False, "LM Studio returned invalid scores.", errors=validation.errors)
+            return EvaluationResult(
+                False,
+                "LM Studio returned invalid scores.",
+                errors=validation.errors,
+                payload={
+                    "debug_payload": result.get("_debug_payload"),
+                    "debug_raw_response": result.get("_debug_raw_response"),
+                },
+            )
         identity = self.identities.get_or_create_local()
         now = utc_now_iso()
         subscores = result.get("subscores") if isinstance(result.get("subscores"), dict) else {}
@@ -1183,7 +1197,15 @@ class EvaluationService:
         self.evaluations.save(evaluation)
         if self.rarity_service:
             self.rarity_service.refresh_from_evaluation(evaluation)
-        return EvaluationResult(True, "LM Studio evaluation saved.", evaluation=evaluation)
+        return EvaluationResult(
+            True,
+            "LM Studio evaluation saved.",
+            evaluation=evaluation,
+            payload={
+                "debug_payload": result.get("_debug_payload"),
+                "debug_raw_response": result.get("_debug_raw_response"),
+            },
+        )
 
     def evaluate_sample_with_lm_studio(
         self,
@@ -1208,16 +1230,30 @@ class EvaluationService:
                 sample=sample,
             )
         except Exception as exc:  # noqa: BLE001 - surface local model errors to the queue runner
+            debug_payload = getattr(exc, "debug_payload", None)
+            debug_raw_response = getattr(exc, "debug_raw_response", None)
             return EvaluationResult(
                 False,
                 f"LM Studio evaluation failed: {exc}",
                 errors=[str(exc)],
-                payload={"fatal": self._model_exception_is_fatal(exc)},
+                payload={
+                    "fatal": self._model_exception_is_fatal(exc),
+                    "debug_payload": debug_payload,
+                    "debug_raw_response": debug_raw_response,
+                },
             )
         scores = result.get("scores", {})
         validation = SchemaPolicy.validate_scores(schema, scores)
         if not validation.valid:
-            return EvaluationResult(False, "LM Studio returned invalid scores.", errors=validation.errors)
+            return EvaluationResult(
+                False,
+                "LM Studio returned invalid scores.",
+                errors=validation.errors,
+                payload={
+                    "debug_payload": result.get("_debug_payload"),
+                    "debug_raw_response": result.get("_debug_raw_response"),
+                },
+            )
         identity = self.identities.get_or_create_local()
         now = utc_now_iso()
         subscores = result.get("subscores") if isinstance(result.get("subscores"), dict) else {}
@@ -1248,7 +1284,15 @@ class EvaluationService:
         self.evaluations.save(evaluation)
         if self.rarity_service:
             self.rarity_service.refresh_from_evaluation(evaluation)
-        return EvaluationResult(True, "LM Studio evaluation saved.", evaluation=evaluation)
+        return EvaluationResult(
+            True,
+            "LM Studio evaluation saved.",
+            evaluation=evaluation,
+            payload={
+                "debug_payload": result.get("_debug_payload"),
+                "debug_raw_response": result.get("_debug_raw_response"),
+            },
+        )
 
     @staticmethod
     def _model_exception_is_fatal(exc: Exception) -> bool:
@@ -1354,6 +1398,8 @@ class QueueClusterTarget:
     name: str
     active_count: int
     completed_count: int
+    fandom_key: str = ""
+    fandom_color: str = "#58a6ff"
 
 
 @dataclass(slots=True)
@@ -1608,15 +1654,22 @@ class EvaluationQueueService:
     def evaluated_works_for_batch(self, batch_id: str) -> EvaluationBatchWorks | None:
         return self._works_for_batch(batch_id, completed=True)
 
-    def cluster_targets(self, fandom_key: str) -> list[QueueClusterTarget]:
+    def cluster_targets(self, fandom_key: str | None = None) -> list[QueueClusterTarget]:
+        if fandom_key:
+            summaries = self._cluster_summaries(fandom_key)
+        else:
+            summaries = self._all_cluster_summaries()
+        fandom_colors = {fandom.fandom_key: fandom.color for fandom in self.fandoms.list()}
         return [
             QueueClusterTarget(
                 work_set_id=cluster.work_set.id,
                 name=cluster.work_set.name,
                 active_count=cluster.active_count,
                 completed_count=cluster.completed_count,
+                fandom_key=cluster.work_set.fandom_key,
+                fandom_color=fandom_colors.get(cluster.work_set.fandom_key, "#58a6ff"),
             )
-            for cluster in self._cluster_summaries(fandom_key)
+            for cluster in summaries
         ]
 
     def queue_work_to_named_cluster(
@@ -1637,6 +1690,8 @@ class EvaluationQueueService:
             return ServiceResult(False, "Work was not found.")
         schema = self._schema(schema_key)
         work_set = self.work_sets.get_by_name(fandom_key, clean_name)
+        if not work_set:
+            work_set = self.work_sets.get_by_name_any_fandom(clean_name)
         if not work_set:
             now = utc_now_iso()
             work_set = WorkSet(
@@ -1675,7 +1730,7 @@ class EvaluationQueueService:
                     priority=100,
                     batch_id=batch.id,
                     schema_key=batch.schema_key,
-                    fandom_key_value=fandom_key,
+                    fandom_key_value=work_set.fandom_key,
                 )
                 queued = 1
         self._sync_batch_status(batch)
@@ -1798,9 +1853,13 @@ class EvaluationQueueService:
         batch = self.batches.get_by_work_set_schema(work_set.id, schema.schema_key)
         if not batch:
             return ServiceResult(True, f"{schema.name} is already empty for {work_set.name}.")
-        deleted_evaluations, deleted_queue_rows = self._delete_batch_local_data(batch, keep_work_set=True)
+        work_ids = self.work_sets.list_work_ids(work_set.id)
+        is_last = (self.batches.count_for_work_set(work_set.id) <= 1)
+        deleted_evaluations, deleted_queue_rows = self._delete_batch_local_data(batch, keep_work_set=not is_last)
         self.batches.delete(batch.id)
-        deleted_cache = self.works.delete_unprotected_by_ids(self.work_sets.list_work_ids(work_set.id))
+        if is_last:
+            self.work_sets.delete(work_set.id)
+        deleted_cache = self.works.delete_unprotected_by_ids(work_ids)
         return ServiceResult(
             True,
             f"Cleared {schema.name} for {work_set.name}: {deleted_evaluations} evaluation record"
@@ -2016,6 +2075,21 @@ class EvaluationQueueService:
         clusters = [
             self._cluster_summary(work_set, schemas, local_user_id)
             for work_set in self.work_sets.list_for_fandom(fandom_key)
+        ]
+        clusters.sort(
+            key=lambda cluster: (
+                not bool(self._cluster_meta(cluster.work_set).get("favorite")),
+                str(cluster.work_set.name).casefold(),
+            )
+        )
+        return clusters
+
+    def _all_cluster_summaries(self) -> list[EvaluationClusterSummary]:
+        schemas = self.schemas.list()
+        local_user_id = self.identities.get_or_create_local().local_user_id
+        clusters = [
+            self._cluster_summary(work_set, schemas, local_user_id)
+            for work_set in self.work_sets.list_all()
         ]
         clusters.sort(
             key=lambda cluster: (
@@ -3542,12 +3616,40 @@ class QueueEvaluationRunnerService:
             self.queue_service.sync_batch_status(batch.id)
             return ServiceResult(True, "No unevaluated works remain in this queue.", payload=stats)
 
+        from datetime import datetime
+        from app.infrastructure.config.paths import ROOT_DIR
+
+        log_file_path = ROOT_DIR / "logs" / "latest_queue_run.json"
+        log_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        config = self.config()
+        log_data = {
+            "batch_id": batch_id,
+            "schema_key": batch.schema_key,
+            "start_time": datetime.now().isoformat(),
+            "config": {
+                "include_metadata": config.include_metadata,
+                "include_tags": config.include_tags,
+                "start_chapter": config.start_chapter,
+                "chapter_window": config.chapter_window,
+                "target_words": config.target_words,
+                "max_words": config.max_words,
+                "skip_empty_chapters": config.skip_empty_chapters,
+            },
+            "evaluations": []
+        }
+
+        try:
+            with open(log_file_path, "w", encoding="utf-8") as f:
+                json.dump(log_data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
         session_result = self.local_model_service.begin_queue_model_session()
         if not session_result.ok:
             stats.fatal = True
             return ServiceResult(False, session_result.message, payload=stats)
         session = session_result.payload if isinstance(session_result.payload, dict) else {}
-        config = self.config()
         fatal_message = ""
         try:
             for work_id in candidates:
@@ -3557,28 +3659,115 @@ class QueueEvaluationRunnerService:
                 row = rows.get(work_id)
                 if not row:
                     continue
+
+                work_title = ""
+                work_obj = self.works.get(work_id)
+                if work_obj:
+                    work_title = work_obj.title
+
+                eval_record = {
+                    "work_id": work_id,
+                    "title": work_title,
+                    "status": "pending",
+                    "timestamp": datetime.now().isoformat(),
+                    "prompt_payload": None,
+                    "raw_response": None,
+                    "parsed_response": None,
+                    "errors": []
+                }
+
                 self.queue.update_status(row.id, QueueStatus.RUNNING)
                 sample = self.sample_work(work_id, config)
                 if not sample.ok or not isinstance(sample.payload, WorkEvaluationSample):
                     self.queue.update_status(row.id, QueueStatus.FAILED, sample.message)
                     stats.failed += 1
+
+                    eval_record["status"] = "failed"
+                    eval_record["errors"] = [sample.message]
+                    log_data["evaluations"].append(eval_record)
+                    try:
+                        with open(log_file_path, "w", encoding="utf-8") as f:
+                            json.dump(log_data, f, indent=2, ensure_ascii=False)
+                    except Exception:
+                        pass
                     continue
+
                 result = self.evaluation_service.evaluate_sample_with_lm_studio(work_id, batch.schema_key, sample.payload)
+
+                debug_payload = None
+                debug_raw_response = None
+                if isinstance(result.payload, dict):
+                    debug_payload = result.payload.get("debug_payload")
+                    debug_raw_response = result.payload.get("debug_raw_response")
+
+                import copy
+                pruned_payload = None
+                if debug_payload and isinstance(debug_payload, dict):
+                    pruned_payload = copy.deepcopy(debug_payload)
+                    if "messages" in pruned_payload and isinstance(pruned_payload["messages"], list):
+                        for msg in pruned_payload["messages"]:
+                            if isinstance(msg, dict):
+                                msg.pop("content", None)
+
+                eval_record["prompt_payload"] = pruned_payload
+                eval_record["raw_response"] = debug_raw_response
+
                 if not result.ok:
                     error_text = "; ".join(result.errors[:2]) or result.message
                     self.queue.update_status(row.id, QueueStatus.FAILED, error_text)
                     stats.failed += 1
+
+                    eval_record["status"] = "failed"
+                    eval_record["errors"] = result.errors or [result.message]
+                    log_data["evaluations"].append(eval_record)
+                    try:
+                        with open(log_file_path, "w", encoding="utf-8") as f:
+                            json.dump(log_data, f, indent=2, ensure_ascii=False)
+                    except Exception:
+                        pass
+
                     if isinstance(result.payload, dict) and result.payload.get("fatal"):
                         stats.fatal = True
                         fatal_message = result.message
                         break
                     continue
+
                 self.queue.update_status(row.id, QueueStatus.DONE)
                 stats.completed += 1
                 self.queue_service.sync_batch_status(batch.id)
+
+                eval_record["status"] = "success"
+                if result.evaluation:
+                    eval_record["parsed_response"] = {
+                        "scores": result.evaluation.scores,
+                        "subscores": result.evaluation.subscores,
+                        "notes_markdown": result.evaluation.notes_markdown,
+                        "evidence": result.evaluation.evidence,
+                    }
+
+                log_data["evaluations"].append(eval_record)
+                try:
+                    with open(log_file_path, "w", encoding="utf-8") as f:
+                        json.dump(log_data, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
         finally:
             unload_result = self.local_model_service.end_queue_model_session(session)
             self.queue_service.sync_batch_status(batch.id)
+
+            log_data["end_time"] = datetime.now().isoformat()
+            log_data["stats"] = {
+                "total": stats.total,
+                "completed": stats.completed,
+                "failed": stats.failed,
+                "cancelled": stats.cancelled,
+                "fatal": stats.fatal,
+            }
+            try:
+                with open(log_file_path, "w", encoding="utf-8") as f:
+                    json.dump(log_data, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
 
         if stats.fatal:
             return ServiceResult(False, fatal_message or "Queue evaluation stopped after an LM Studio error.", payload=stats)

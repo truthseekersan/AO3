@@ -20,6 +20,7 @@ from app.application.services import (
     DEFAULT_READER_STYLE,
     STYLE_OVERRIDE_SECTIONS_KEY,
     default_fandom_filter,
+    evaluation_quality_score,
     fandom_key,
     normalize_character_reader_style,
     normalize_ao3_date_filter,
@@ -585,6 +586,17 @@ class AO3StudioShell:
                                         value=bool(self.container.preferences_service.get("show_all_works", False)),
                                         on_change=lambda e: self._toggle_show_all_works(e.value)
                                     )
+                    elif label == "Evaluated":
+                        tab.on("contextmenu", lambda _=None: None, js_handler="(event) => { event.preventDefault(); event.stopPropagation(); emit(); }")
+                        with tab:
+                            with ui.context_menu().classes("tag-favorite-menu"):
+                                with ui.column().classes("gap-2 p-2 min-w-[180px]"):
+                                    ui.label("Evaluated Settings").classes("text-xs font-bold uppercase text-gray-500")
+                                    show_all_eval_checkbox = ui.checkbox(
+                                        "Show all works",
+                                        value=bool(self.container.preferences_service.get("show_all_evaluated_works", False)),
+                                        on_change=lambda e: self._toggle_show_all_evaluated_works(e.value)
+                                    )
             with ui.row().classes("center-toolbar-right items-center justify-end gap-1 shrink-0 px-2"):
                 if self.page == "Read":
                     reader = self._reader_top_context()
@@ -648,6 +660,12 @@ class AO3StudioShell:
         self.container.preferences_service.set("show_all_works", bool(value))
         self._notify("Showing all works." if value else "Showing works for current fandom only.", "info")
         self._works_page_model = None
+        self.refresh()
+
+    def _toggle_show_all_evaluated_works(self, value: bool) -> None:
+        self.container.preferences_service.set("show_all_evaluated_works", bool(value))
+        self._notify("Showing all evaluated works." if value else "Showing evaluated works for current fandom only.", "info")
+        self._evaluated_page_model = None
         self.refresh()
 
     def _current_browse_visible_ids(self) -> list[str]:
@@ -845,7 +863,66 @@ class AO3StudioShell:
         )
         if not source:
             return None
-        work_ids = tuple(work.work_id for work in source.works)
+        works = list(source.works)
+        show_all_eval = True
+        if mode == "evaluated":
+            show_all_eval = bool(self.container.preferences_service.get("show_all_evaluated_works", False))
+            if not show_all_eval:
+                fandoms = {f.fandom_key: f for f in self.container.fandom_repo.list()}
+                cluster_fkey = source.work_set.fandom_key
+                cluster_fprofile = fandoms.get(cluster_fkey)
+                if cluster_fprofile and works:
+                    with self.container.db.connect() as conn:
+                        rows = conn.execute(
+                            "SELECT work_id, fandom_key FROM work_collection WHERE work_id IN ({})".format(
+                                ",".join("?" for _ in works)
+                            ),
+                            [w.work_id for w in works]
+                        ).fetchall()
+                    collected_map = {}
+                    for row in rows:
+                        collected_map.setdefault(str(row["work_id"]), set()).add(str(row["fandom_key"]))
+
+                    filtered_works = []
+                    for w in works:
+                        # 1. Check if it belongs to current cluster's fandom
+                        belongs_to_current = False
+                        if cluster_fkey in collected_map.get(w.work_id, set()):
+                            belongs_to_current = True
+                        w_tags = source.tags_by_work.get(w.work_id, []) if source.tags_by_work else []
+                        for t in w_tags:
+                            if t.tag_type == TagType.FANDOM:
+                                t_text = t.tag_text.lower()
+                                f_tag = cluster_fprofile.tag.lower()
+                                f_disp = cluster_fprofile.display_name.lower()
+                                if t_text == f_tag or f_disp in t_text or ("lost records" in f_disp and "lost records" in t_text):
+                                    belongs_to_current = True
+                                    break
+
+                        # 2. Check if it belongs to any OTHER fandom profile in the system
+                        belongs_to_other = False
+                        for fk, f in fandoms.items():
+                            if fk == cluster_fkey:
+                                continue
+                            if fk in collected_map.get(w.work_id, set()):
+                                belongs_to_other = True
+                                break
+                            for t in w_tags:
+                                if t.tag_type == TagType.FANDOM:
+                                    t_text = t.tag_text.lower()
+                                    f_tag = f.tag.lower()
+                                    f_disp = f.display_name.lower()
+                                    if t_text == f_tag or f_disp in t_text or ("lost records" in f_disp and "lost records" in t_text):
+                                        belongs_to_other = True
+                                        break
+                            if belongs_to_other:
+                                break
+
+                        # Keep the work if it belongs to current fandom, OR if it does NOT belong to any other fandom
+                        if belongs_to_current or not belongs_to_other:
+                            filtered_works.append(w)
+                    works = filtered_works
+        work_ids = tuple(work.work_id for work in works)
         cache_key = (
             mode,
             source.batch.id,
@@ -853,6 +930,7 @@ class AO3StudioShell:
             source.batch.status.value,
             source.work_set.updated_at,
             source.schema.schema_key,
+            show_all_eval,
             tuple(work_ids),
         )
         current = self._evaluated_page_model if mode == "evaluated" else self._queue_page_model
@@ -860,7 +938,7 @@ class AO3StudioShell:
             return current
         model = self._work_list_render_model(
             cache_key=cache_key,
-            works=source.works,
+            works=works,
             tags_by_work=source.tags_by_work,
             latest_evaluations=source.latest_evaluations,
             schema=source.schema,
@@ -4518,6 +4596,7 @@ class AO3StudioShell:
             work = view.work
             ui.label(work.title or f"Work {work.work_id}").classes("text-lg font-bold")
             ui.label(work.author_name or "Unknown author").classes("text-sm text-gray-400")
+            active = self._active_fandom()
             with ui.element("div").classes("soft-panel w-full p-3"):
                 ui.label("Score Breakdown").classes("text-sm font-bold mb-2")
                 if view.local_evaluation:
@@ -4525,6 +4604,16 @@ class AO3StudioShell:
                         with ui.row().classes("w-full justify-between"):
                             ui.label(str(key)).classes("text-xs text-gray-500")
                             ui.label(str(value)).classes("text-xs font-bold")
+                            evidence_text = ""
+                            if isinstance(view.local_evaluation.evidence, dict):
+                                evidence_text = view.local_evaluation.evidence.get(str(key)) or ""
+                            if evidence_text:
+                                rich_tooltip(evidence_text, active.color)
+                    q_score = evaluation_quality_score(view.local_evaluation)
+                    if q_score is not None:
+                        with ui.row().classes("w-full justify-between mt-1 pt-1 border-t border-gray-700/50"):
+                            ui.label("Quality Score").classes("text-xs font-bold text-gray-400")
+                            ui.label(f"{q_score:.2f}").classes("text-xs font-bold").style(f"color: {normalized_label_color(active.color)}")
                     if view.local_evaluation.model_name:
                         ui.label(f"Model: {view.local_evaluation.model_name}").classes("text-[11px] text-gray-500 mt-2")
                 else:
@@ -5920,7 +6009,7 @@ class AO3StudioShell:
         schema = self.container.schema_repo.get(schema_key) or self.container.schema_service.active_schema()
         with ui.element("div").classes("soft-panel w-full p-3"):
             self._segmented_cluster_pills("", state, "score_dir", [("desc", "High"), ("asc", "Low")], color)
-            options = {"": "Any score"}
+            options = {"": "Any score", "quality_score": "Quality Score"}
             options.update({dimension.key: dimension.label for dimension in schema.dimensions})
             with ui.row().classes("w-full items-center gap-1 flex-nowrap"):
                 ui.select(options, value=state.get("score_key") or "", label="Score").bind_value(state, "score_key").props(
@@ -6464,7 +6553,10 @@ class AO3StudioShell:
                 return False
             if mode == "evaluated" and score_key:
                 evaluation = model.latest_evaluations.get(work.work_id)
-                raw_score = evaluation.scores.get(score_key) if evaluation else None
+                if score_key == "quality_score":
+                    raw_score = evaluation_quality_score(evaluation) if evaluation else None
+                else:
+                    raw_score = evaluation.scores.get(score_key) if evaluation else None
                 try:
                     score = float(raw_score)
                 except (TypeError, ValueError):
@@ -6485,7 +6577,11 @@ class AO3StudioShell:
             def score_key_fn(work: Work) -> tuple[float, str]:
                 evaluation = model.latest_evaluations.get(work.work_id)
                 try:
-                    score = float(evaluation.scores.get(score_key) if evaluation else -1)
+                    if score_key == "quality_score":
+                        raw_val = evaluation_quality_score(evaluation) if evaluation else -1
+                    else:
+                        raw_val = evaluation.scores.get(score_key) if evaluation else -1
+                    score = float(raw_val if raw_val is not None else -1)
                 except (TypeError, ValueError):
                     score = -1
                 return (score, (work.title or "").casefold())
@@ -7619,7 +7715,17 @@ class AO3StudioShell:
         if not work:
             self._notify("Work was not found.", "negative")
             return
-        targets = self.container.queue_service.cluster_targets(active.fandom_key)
+        all_targets = self.container.queue_service.cluster_targets()
+        seen = set()
+        targets = []
+        for t in all_targets:
+            if t.fandom_key == active.fandom_key:
+                seen.add(t.name.casefold())
+                targets.append(t)
+        for t in all_targets:
+            if t.name.casefold() not in seen:
+                seen.add(t.name.casefold())
+                targets.append(t)
         draft = {"name": ""}
         dialog = ui.dialog()
         dialog.on("hide", dialog.delete)
@@ -7637,18 +7743,25 @@ class AO3StudioShell:
             if container is None:
                 return
             query = str(draft.get("name") or "").casefold().strip()
-            matches = [
-                target
-                for target in targets
-                if not query or query in target.name.casefold()
-            ][:8]
+            if not query:
+                matches = [
+                    target
+                    for target in targets
+                    if target.fandom_key == active.fandom_key
+                ][:8]
+            else:
+                matches = [
+                    target
+                    for target in targets
+                    if query in target.name.casefold()
+                ][:8]
             container.clear()
             with container:
                 if matches:
                     with ui.row().classes("w-full gap-1 flex-wrap"):
                         for target in matches:
                             pill = ui.button(target.name).props("dense rounded no-caps").classes("filter-favorite-pill")
-                            pill.style(self._filter_pill_style(active.color, target.name == draft.get("name")))
+                            pill.style(self._filter_pill_style(target.fandom_color, target.name == draft.get("name")))
                             pill.on(
                                 "click.stop",
                                 lambda _=None, name=target.name: set_name(name),
@@ -7656,7 +7769,7 @@ class AO3StudioShell:
                             with pill:
                                 rich_tooltip(
                                     f"{target.active_count} pending | {target.completed_count} evaluated",
-                                    active.color,
+                                    target.fandom_color,
                                 )
                 elif query:
                     ui.label("Press Save to create this queue.").classes("text-xs text-gray-500")
@@ -8155,6 +8268,7 @@ class AO3StudioShell:
         favorite_lookup = lookup_model.favorite_lookup if lookup_model else self._favorite_tag_map(active.fandom_key)
         tag_color_lookup = lookup_model.tag_color_lookup if lookup_model else self._tag_color_map(active.fandom_key)
         style_settings = lookup_model.style_settings if lookup_model else self.container.style_service.effective_settings(active.fandom_key)
+        r, g, b = rgb_from_hex(active.color)
         if title:
             ui.label(title).classes("text-sm font-bold text-gray-300")
         if not works:
@@ -8187,6 +8301,28 @@ class AO3StudioShell:
             with card:
                 self._attach_rarity_context_menu(work.work_id, active.color)
                 with ui.row().classes("work-card-actions items-center gap-1"):
+                    if self.page == "Evaluated":
+                        eval_state = self._cluster_filter_state("evaluated")
+                        score_key = str(eval_state.get("score_key") or "")
+                        if score_key and lookup_model and hasattr(lookup_model, "latest_evaluations"):
+                            evaluation = lookup_model.latest_evaluations.get(work.work_id)
+                            if evaluation:
+                                if score_key == "quality_score":
+                                    score_val = evaluation_quality_score(evaluation)
+                                    score_label = f"QS: {score_val:.2f}" if score_val is not None else ""
+                                else:
+                                    score_val = evaluation.scores.get(score_key)
+                                    dimension_label = score_key
+                                    schema = self.container.schema_repo.get(evaluation.schema_key) or self.container.schema_service.active_schema()
+                                    for d in schema.dimensions:
+                                        if d.key == score_key:
+                                            dimension_label = d.label
+                                            break
+                                    score_label = f"{dimension_label}: {score_val}" if score_val is not None else ""
+                                if score_label:
+                                    ui.label(score_label).classes("text-[11px] font-bold px-2 py-0.5 rounded-full").style(
+                                        f"color: {normalized_label_color(active.color)}; border: 1px solid rgba({r},{g},{b},0.34); background: rgba({r},{g},{b},0.12);"
+                                    )
                     has_left_action = False
                     if browse_actions and not is_collected:
                         collect = ui.button(icon="bookmark_add").props("round flat dense size=md").classes("work-action-button")
@@ -8789,6 +8925,16 @@ class AO3StudioShell:
                         with refresh:
                             rich_tooltip("Refresh this work", active.color)
                 with ui.row().classes("w-full gap-2 flex-wrap mt-2"):
+                    quality_val = evaluation_quality_score(latest) if latest else None
+                    with ui.element("div").classes("score-pill px-2 py-2").style(
+                        f"border: 1px solid rgba({r},{g},{b},0.34); background: rgba({r},{g},{b},0.12);"
+                    ):
+                        ui.number(
+                            "Quality Score",
+                            value=quality_val,
+                        ).props("outlined dense dark hide-bottom-space readonly").classes("w-36")
+                        rich_tooltip("Calculated overall quality score (read-only)", active.color).classes("multiline-tooltip")
+
                     for dimension in schema.dimensions:
                         with ui.element("div").classes("score-pill px-2 py-2").style(
                             f"border: 1px solid rgba({r},{g},{b},0.24); background: rgba({r},{g},{b},0.075);"
@@ -8800,6 +8946,8 @@ class AO3StudioShell:
                                 max=schema.score_range.maximum,
                                 step=schema.score_range.step,
                             ).bind_value(score_state, dimension.key).props("outlined dense dark hide-bottom-space").classes("w-36")
+                            if latest and latest.evidence and latest.evidence.get(dimension.key):
+                                rich_tooltip(latest.evidence[dimension.key], active.color).classes("multiline-tooltip")
                 ui.textarea("Notes and evidence", value=note_state["notes"]).bind_value(note_state, "notes").props(
                     "borderless dense dark autogrow"
                 ).classes("w-full mt-2 evaluation-notes-field").style(f"--note-r:{nr}; --note-g:{ng}; --note-b:{nb};")

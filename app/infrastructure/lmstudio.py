@@ -136,14 +136,23 @@ class LMStudioEvaluationProvider:
             "temperature": self.temperature,
             "stream": False,
         }
-        with httpx.Client(timeout=self.timeout) as client:
-            response = client.post(f"{self.base_url}/chat/completions", json=payload)
-            response.raise_for_status()
-            data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        result = json.loads(content)
-        result["model_name"] = model
-        return result
+        content = None
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.post(f"{self.base_url}/chat/completions", json=payload)
+                response.raise_for_status()
+                data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            result = json.loads(content)
+            result["model_name"] = model
+            result["_debug_payload"] = payload
+            result["_debug_raw_response"] = content
+            return result
+        except Exception as exc:
+            setattr(exc, "debug_payload", payload)
+            if content is not None:
+                setattr(exc, "debug_raw_response", content)
+            raise exc
 
     def evaluate_sampled_work(
         self,
@@ -164,14 +173,23 @@ class LMStudioEvaluationProvider:
             "temperature": self.temperature,
             "stream": False,
         }
-        with httpx.Client(timeout=self.timeout) as client:
-            response = client.post(f"{self.base_url}/chat/completions", json=payload)
-            response.raise_for_status()
-            data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        result = json.loads(content)
-        result["model_name"] = model
-        return result
+        content = None
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.post(f"{self.base_url}/chat/completions", json=payload)
+                response.raise_for_status()
+                data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            result = json.loads(content)
+            result["model_name"] = model
+            result["_debug_payload"] = payload
+            result["_debug_raw_response"] = content
+            return result
+        except Exception as exc:
+            setattr(exc, "debug_payload", payload)
+            if content is not None:
+                setattr(exc, "debug_raw_response", content)
+            raise exc
 
     @staticmethod
     def _messages(

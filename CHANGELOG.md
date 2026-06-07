@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-06-07
+
+### Added
+- Added right-click context menu to the "Evaluated" tab name with a "Show all works" checkbox to toggle cross-fandom evaluated work visibility.
+
+### Changed
+- Refined Evaluated tab filtering logic to check the work's fandom tag boundary (checking the work's fandom tags and falling back to collection keys) instead of only checking the works tab (`work_collection`) presence. This correctly keeps works with sub-fandom tags (like `"Life is Strange: Double Exposure"`) or uncollected works belonging to the active cluster's fandom.
+
+### Fixed
+- Fixed empty "ghost" queue clusters by purging empty `WorkSet` rows when their last batch is cleared in `clean_evaluated_schema_slot`.
+- Fixed suggestions filtering in the "Queue Work" dialog to only show suggestion pills belonging to the work's active fandom prior to typing relevant text.
+
+### Tests
+- Added database migration (version 20) and empty cluster deletion verification tests.
+- Added unit test coverage for the Evaluated tab "Show all works" option, including sub-fandom tags, uncollected works, and other-fandom filtering.
+
 ## 2026-06-06
 
 ### Added

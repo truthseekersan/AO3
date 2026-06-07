@@ -1695,6 +1695,172 @@ def test_reader_apply_dam_custom_dialogue_tints() -> None:
     assert expected_fallback_lightened in rendered_default
 
 
+def test_evaluated_tab_show_all_works_filtering(tmp_path) -> None:
+    from app.domain.entities import WorkSet, EvaluationBatch, EvaluationSchema, Evaluation, EvaluationQueueItem
+    from app.domain.enums import EvaluationStatus, EvaluationBatchStatus, QueueStatus
+
+    container = build_container(tmp_path / "ao3.sqlite")
+
+    fandom1 = FandomProfile(fandom_key="lis", tag="Life is Strange", display_name="Life is Strange")
+    fandom2 = FandomProfile(fandom_key="btvs", tag="Buffy the Vampire Slayer", display_name="Buffy")
+    container.fandom_repo.save(fandom1)
+    container.fandom_repo.save(fandom2)
+
+    w1 = Work("work-lis", "https://url1", title="LIS Work", last_scraped_at="2026-01-01T00:00:00Z")
+    w2 = Work("work-buffy", "https://url2", title="Buffy Work", last_scraped_at="2026-01-01T00:00:00Z")
+    w3 = Work("work-lis-uncollected", "https://url3", title="LIS Uncollected", last_scraped_at="2026-01-01T00:00:00Z")
+    w4 = Work("work-lis-subtag", "https://url4", title="LIS Subtag", last_scraped_at="2026-01-01T00:00:00Z")
+    container.work_repo.upsert(w1)
+    container.work_repo.upsert(w2)
+    container.work_repo.upsert(w3)
+    container.work_repo.upsert(w4)
+
+    container.tag_repo.replace_for_work("work-lis", [WorkTag("work-lis", TagType.FANDOM, "Life is Strange")])
+    container.tag_repo.replace_for_work("work-buffy", [WorkTag("work-buffy", TagType.FANDOM, "Buffy the Vampire Slayer")])
+    container.tag_repo.replace_for_work("work-lis-uncollected", [WorkTag("work-lis-uncollected", TagType.FANDOM, "Life is Strange")])
+    container.tag_repo.replace_for_work("work-lis-subtag", [WorkTag("work-lis-subtag", TagType.FANDOM, "Life is Strange: Double Exposure")])
+
+    container.work_library_service.collect("work-lis", "lis")
+    container.work_library_service.collect("work-buffy", "btvs")
+
+    # Create a work set (cluster) under 'lis'
+    work_set = WorkSet(
+        id="cluster-1",
+        fandom_key="lis",
+        name="LIS Cluster",
+        filter_state={},
+        filter_signature="sig",
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+    container.work_set_repo.save(work_set)
+    container.work_set_repo.add_items("cluster-1", ["work-lis", "work-buffy", "work-lis-uncollected", "work-lis-subtag"])
+
+    batch = EvaluationBatch(
+        id="batch-1",
+        work_set_id="cluster-1",
+        fandom_key="lis",
+        schema_key="default",
+        status=EvaluationBatchStatus.COMPLETE,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+    container.batch_repo.save(batch)
+
+    schema = EvaluationSchema(
+        schema_key="default",
+        name="Default",
+        version="1.0",
+        label="Default",
+        description="Default Schema",
+        dimensions=[],
+        created_at="2026-01-01T00:00:00Z",
+    )
+    container.schema_repo.save(schema)
+    local_user_id = container.identity_service.bootstrap().local_user_id
+
+    # Complete evaluations for all four works
+    eval1 = Evaluation(
+        id="eval-1",
+        work_id="work-lis",
+        local_user_id=local_user_id,
+        schema_key="default",
+        schema_version="1.0",
+        scores={},
+        status=EvaluationStatus.COMPLETE,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+    eval2 = Evaluation(
+        id="eval-2",
+        work_id="work-buffy",
+        local_user_id=local_user_id,
+        schema_key="default",
+        schema_version="1.0",
+        scores={},
+        status=EvaluationStatus.COMPLETE,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+    eval3 = Evaluation(
+        id="eval-3",
+        work_id="work-lis-uncollected",
+        local_user_id=local_user_id,
+        schema_key="default",
+        schema_version="1.0",
+        scores={},
+        status=EvaluationStatus.COMPLETE,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+    eval4 = Evaluation(
+        id="eval-4",
+        work_id="work-lis-subtag",
+        local_user_id=local_user_id,
+        schema_key="default",
+        schema_version="1.0",
+        scores={},
+        status=EvaluationStatus.COMPLETE,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+    )
+    container.evaluation_repo.save(eval1)
+    container.evaluation_repo.save(eval2)
+    container.evaluation_repo.save(eval3)
+    container.evaluation_repo.save(eval4)
+
+    # Insert into evaluation queue
+    item1 = EvaluationQueueItem(
+        id="q-1",
+        batch_id="batch-1",
+        work_id="work-lis",
+        priority=1,
+        queue_status=QueueStatus.DONE,
+        requested_at="2026-01-01T00:00:00Z",
+    )
+    item2 = EvaluationQueueItem(
+        id="q-2",
+        batch_id="batch-1",
+        work_id="work-buffy",
+        priority=2,
+        queue_status=QueueStatus.DONE,
+        requested_at="2026-01-01T00:00:00Z",
+    )
+    item3 = EvaluationQueueItem(
+        id="q-3",
+        batch_id="batch-1",
+        work_id="work-lis-uncollected",
+        priority=3,
+        queue_status=QueueStatus.DONE,
+        requested_at="2026-01-01T00:00:00Z",
+    )
+    item4 = EvaluationQueueItem(
+        id="q-4",
+        batch_id="batch-1",
+        work_id="work-lis-subtag",
+        priority=4,
+        queue_status=QueueStatus.DONE,
+        requested_at="2026-01-01T00:00:00Z",
+    )
+    container.queue_repo.add(item1)
+    container.queue_repo.add(item2)
+    container.queue_repo.add(item3)
+    container.queue_repo.add(item4)
+
+    shell = AO3StudioShell(container)
+    container.preferences_service.set("active_fandom_key", "lis")
+
+    # By default, show_all_evaluated_works is false, so it should show work-lis, work-lis-uncollected, and work-lis-subtag
+    # but NOT work-buffy
+    model_filtered = shell._cluster_page_model_for_mode("evaluated", "batch-1")
+    assert set(w.work_id for w in model_filtered.works) == {"work-lis", "work-lis-uncollected", "work-lis-subtag"}
+
+    # If we toggle show_all_evaluated_works to True, it should show all four
+    shell._toggle_show_all_evaluated_works(True)
+    model_all = shell._cluster_page_model_for_mode("evaluated", "batch-1")
+    assert set(w.work_id for w in model_all.works) == {"work-lis", "work-buffy", "work-lis-uncollected", "work-lis-subtag"}
+
+
 
 
 

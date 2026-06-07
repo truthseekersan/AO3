@@ -182,6 +182,13 @@ def apply_theme() -> None:
                 font-family: "Fira Code", ui-monospace, SFMono-Regular, monospace !important;
             }
             .q-btn { text-transform: none !important; }
+            .multiline-tooltip {
+                max-width: 280px !important;
+                white-space: normal !important;
+                word-break: break-word !important;
+                line-height: 1.42 !important;
+                text-align: left !important;
+            }
             .main-content {
                 height: 100vh;
                 width: 100%;

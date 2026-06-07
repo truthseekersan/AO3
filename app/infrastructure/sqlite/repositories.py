@@ -1373,11 +1373,26 @@ class SQLiteWorkSetRepository:
             ).fetchone()
         return self._row(row) if row else None
 
+    def get_by_name_any_fandom(self, name: str) -> WorkSet | None:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM work_sets WHERE lower(name) = lower(?) ORDER BY updated_at DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+        return self._row(row) if row else None
+
     def list_for_fandom(self, fandom_key: str) -> list[WorkSet]:
         with self.db.connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM work_sets WHERE fandom_key = ? ORDER BY updated_at DESC, name",
                 (fandom_key,),
+            ).fetchall()
+        return [self._row(row) for row in rows]
+
+    def list_all(self) -> list[WorkSet]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM work_sets ORDER BY updated_at DESC, name"
             ).fetchall()
         return [self._row(row) for row in rows]
 
